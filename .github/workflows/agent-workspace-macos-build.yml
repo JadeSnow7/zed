@@ -28,7 +28,7 @@ concurrency:
 jobs:
   build-and-smoke-check:
     name: Build unsigned macOS app (dev channel) + smoke check
-    runs-on: macos-14
+    runs-on: macos-15
     # Cold-cache full release build of the whole workspace on a standard 3-vCPU
     # hosted runner (vs. Zed's own paid namespace-profile-mac-large fleet) can
     # genuinely take well over an hour on the first run. Subsequent runs should be
@@ -38,6 +38,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Report Apple toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          clang --version
 
       - name: Install pinned Rust toolchain (from rust-toolchain.toml)
         run: rustup show
