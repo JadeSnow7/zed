@@ -20,6 +20,7 @@ mod inline_prompt_editor;
 mod language_model_selector;
 mod mention_set;
 mod message_editor;
+pub mod mission_context_observer;
 mod mode_selector;
 mod model_selector;
 mod model_selector_popover;
@@ -617,6 +618,7 @@ pub fn init(
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
     terminal_thread_metadata_store::init(cx);
+    mission_context_observer::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
     terminal_inline_assistant::init(fs.clone(), prompt_builder, cx);
