@@ -1,0 +1,102 @@
+# Not part of Zed's own generated CI (see run_tests.yml, release.yml, etc. — those
+# are gated to `github.repository_owner == 'zed-industries' / 'zed-extensions'` and
+# pinned to Zed's private/paid runner fleet, namespace-profile-* and self-*, none of
+# which this fork has access to). This workflow is hand-written specifically for the
+# feature/* branches built on top of upstream Zed (Mission metadata / Shared Context /
+# Orchestrator / Mission panel), and runs entirely on standard GitHub-hosted runners.
+#
+# It builds a full, unsigned "dev" channel macOS app bundle via the repo's own
+# script/bundle-mac (the same script Zed's real release pipeline uses — signing is
+# skipped automatically when the Apple certificate/notarization secrets are absent,
+# it does not fail), then runs a headless smoke check against the built binary.
+#
+# One-time manual step this workflow cannot do for you: GitHub Actions is disabled by
+# default on forks. Go to this repo's "Actions" tab on github.com and click
+# "I understand my workflows, go ahead and enable them" once before this will fire.
+name: agent-workspace-macos-build
+
+on:
+  push:
+    branches:
+      - "feature/**"
+  workflow_dispatch: {}
+
+concurrency:
+  group: macos-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke-check:
+    name: Build unsigned macOS app (dev channel) + smoke check
+    runs-on: macos-14
+    # Cold-cache full release build of the whole workspace on a standard 3-vCPU
+    # hosted runner (vs. Zed's own paid namespace-profile-mac-large fleet) can
+    # genuinely take well over an hour on the first run. Subsequent runs should be
+    # much faster once Swatinem/rust-cache below has something to restore.
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Cache cargo-bundle (zed's fork, avoids reinstall every run)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-bundle
+          key: cargo-bundle-v0.6.1-zed-macos-${{ runner.arch }}
+
+      - name: Build & bundle macOS app (unsigned dev build)
+        run: script/bundle-mac
+
+      - name: Locate built .app bundle
+        id: locate_app
+        run: |
+          set -euo pipefail
+          app_path=$(find target -maxdepth 5 -iname "*.app" -print -quit)
+          if [[ -z "$app_path" ]]; then
+            echo "::error::Could not find a built .app bundle under target/" >&2
+            find target -maxdepth 5 -iname "*.app" || true
+            exit 1
+          fi
+          echo "Found app bundle: $app_path"
+          echo "app_path=$app_path" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke check — run `cli --version` headlessly
+        # This does not require a display/GUI: crates/cli/src/main.rs handles
+        # --version and returns before any window/app-launch code runs.
+        run: |
+          set -euo pipefail
+          cli_bin="${{ steps.locate_app.outputs.app_path }}/Contents/MacOS/cli"
+          if [[ ! -x "$cli_bin" ]]; then
+            echo "::error::cli binary missing or not executable at $cli_bin" >&2
+            exit 1
+          fi
+          version_output=$("$cli_bin" --version)
+          echo "Reported version: $version_output"
+          if [[ -z "$version_output" ]]; then
+            echo "::error::cli --version produced no output" >&2
+            exit 1
+          fi
+
+      - name: Locate built DMG
+        id: locate_dmg
+        if: always()
+        run: |
+          dmg_path=$(find target -maxdepth 5 -iname "Zed-*.dmg" -print -quit || true)
+          echo "dmg_path=$dmg_path" >> "$GITHUB_OUTPUT"
+
+      - name: Upload DMG as build artifact
+        if: always() && steps.locate_dmg.outputs.dmg_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-macos-dev-build-${{ github.sha }}
+          path: ${{ steps.locate_dmg.outputs.dmg_path }}
+          retention-days: 14
