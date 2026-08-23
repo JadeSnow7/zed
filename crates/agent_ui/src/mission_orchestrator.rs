@@ -19,7 +19,7 @@ use workspace::{ModalView, Workspace};
 use crate::{
     Agent, AgentInitialContent, AgentPanel, AgentThreadSource, CreateThreadOptions,
     conversation_view::RootThreadUpdated,
-    thread_metadata_store::{Mission, MissionId, ThreadMetadataStore},
+    thread_metadata_store::{Mission, MissionId, ThreadId, ThreadMetadataStore},
 };
 
 const SHARED_CONTEXT_SERVER_ID: &str = "shared-context";
@@ -106,17 +106,24 @@ pub fn mission_state(panel: &AgentPanel, mission_id: MissionId, cx: &App) -> Mis
         .read(cx)
         .entries()
         .filter(|metadata| metadata.mission_id == Some(mission_id))
-        .map(|metadata| {
-            let Some(view) = panel.conversation_view_for_id(&metadata.thread_id, cx) else {
-                return MissionThreadState::Created;
-            };
-            let Some(thread) = view.read(cx).root_thread(cx) else {
-                return MissionThreadState::Created;
-            };
-            thread_state(thread.read(cx))
-        });
+        .map(|metadata| thread_mission_state(panel, metadata.thread_id, cx));
 
     aggregate_mission_state(thread_states)
+}
+
+/// Derives a single thread's state from its live `AcpThread` entity, if the
+/// `AgentPanel` currently holds one for it. Used both by `mission_state`
+/// (aggregated across a Mission's threads) and directly by UI that shows a
+/// per-thread status alongside a Mission's aggregate, so callers don't need
+/// to re-derive `thread_state`'s logic themselves.
+pub fn thread_mission_state(panel: &AgentPanel, thread_id: ThreadId, cx: &App) -> MissionThreadState {
+    let Some(view) = panel.conversation_view_for_id(&thread_id, cx) else {
+        return MissionThreadState::Created;
+    };
+    let Some(thread) = view.read(cx).root_thread(cx) else {
+        return MissionThreadState::Created;
+    };
+    thread_state(thread.read(cx))
 }
 
 fn thread_state(thread: &AcpThread) -> MissionThreadState {

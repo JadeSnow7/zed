@@ -22,6 +22,7 @@ mod mention_set;
 mod message_editor;
 pub mod mission_context_observer;
 mod mission_orchestrator;
+mod mission_panel;
 mod mode_selector;
 mod model_selector;
 mod model_selector_popover;
@@ -85,8 +86,9 @@ pub use conversation_view::open_markdown_in_workspace;
 pub use conversation_view::{ConversationView, StateChange};
 pub use external_source_prompt::ExternalSourcePrompt;
 pub use mission_orchestrator::{
-    MissionState, MissionThreadState, aggregate_mission_state, mission_state,
+    MissionState, MissionThreadState, aggregate_mission_state, mission_state, thread_mission_state,
 };
+pub use mission_panel::MissionPanel;
 pub(crate) use mode_selector::ModeSelector;
 pub(crate) use model_selector::ModelSelector;
 pub(crate) use model_selector_popover::ModelSelectorPopover;
@@ -196,6 +198,7 @@ pub enum AgentThreadSource {
     AgentPanel,
     GitPanel,
     Sidebar,
+    MissionPanel,
 }
 
 impl AgentThreadSource {
@@ -204,6 +207,7 @@ impl AgentThreadSource {
             Self::AgentPanel => "agent_panel",
             Self::GitPanel => "git_panel",
             Self::Sidebar => "sidebar",
+            Self::MissionPanel => "mission_panel",
         }
     }
 }

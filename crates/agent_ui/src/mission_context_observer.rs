@@ -65,7 +65,10 @@ pub fn init(cx: &mut App) {
     cx.set_global(GlobalSharedContext(store));
 }
 
-fn shared_context_store(cx: &App) -> Option<SharedContextStore> {
+/// Exposed crate-wide so other UI (e.g. `mission_panel`) can read from the
+/// same process-wide store this observer writes to, without opening a
+/// second connection to the Shared Context database.
+pub(crate) fn shared_context_store(cx: &App) -> Option<SharedContextStore> {
     cx.try_global::<GlobalSharedContext>()
         .and_then(|global| global.0.clone())
 }
