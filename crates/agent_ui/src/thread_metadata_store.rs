@@ -11,7 +11,7 @@ use collections::{HashMap, HashSet};
 use db::{
     kvp::KeyValueStore,
     sqlez::{
-        bindable::{Bind, Column},
+        bindable::{Bind, Column, StaticColumnCount},
         domain::Domain,
         statement::Statement,
         thread_safe_connection::ThreadSafeConnection,
@@ -54,6 +54,64 @@ impl Column for ThreadId {
     fn column(statement: &mut Statement, start_index: i32) -> anyhow::Result<(Self, i32)> {
         let (uuid, next) = Column::column(statement, start_index)?;
         Ok((ThreadId(uuid), next))
+    }
+}
+
+/// Harness-agnostic identifier grouping a set of threads (potentially across
+/// different agents/harnesses) that all serve the same user task.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MissionId(uuid::Uuid);
+
+impl MissionId {
+    pub fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+
+    /// Stable, hyphenated string form suitable for use as a key.
+    pub fn to_key_string(&self) -> String {
+        self.0.hyphenated().to_string()
+    }
+}
+
+impl Bind for MissionId {
+    fn bind(&self, statement: &Statement, start_index: i32) -> anyhow::Result<i32> {
+        self.0.bind(statement, start_index)
+    }
+}
+
+impl Column for MissionId {
+    fn column(statement: &mut Statement, start_index: i32) -> anyhow::Result<(Self, i32)> {
+        let (uuid, next) = Column::column(statement, start_index)?;
+        Ok((MissionId(uuid), next))
+    }
+}
+
+impl StaticColumnCount for MissionId {}
+
+/// Minimal record of a Mission: a user task that one or more threads
+/// (possibly across different agents/harnesses) are working on together.
+/// Lifecycle/state tracking beyond this belongs to the future orchestrator.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mission {
+    pub id: MissionId,
+    pub title: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Column for Mission {
+    fn column(statement: &mut Statement, start_index: i32) -> anyhow::Result<(Self, i32)> {
+        let (id, next): (MissionId, i32) = Column::column(statement, start_index)?;
+        let (title, next): (String, i32) = Column::column(statement, next)?;
+        let (created_at_str, next): (String, i32) = Column::column(statement, next)?;
+        let created_at = DateTime::parse_from_rfc3339(&created_at_str)?.with_timezone(&Utc);
+        Ok((
+            Mission {
+                id,
+                title,
+                created_at,
+            },
+            next,
+        ))
     }
 }
 
@@ -142,6 +200,8 @@ fn migrate_thread_metadata(cx: &mut App) -> Task<anyhow::Result<()>> {
                         worktree_paths: WorktreePaths::from_folder_paths(&entry.folder_paths),
                         remote_connection: None,
                         archived: true,
+                        mission_id: None,
+                        role: None,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -323,6 +383,13 @@ pub struct ThreadMetadata {
     pub worktree_paths: WorktreePaths,
     pub remote_connection: Option<RemoteConnectionOptions>,
     pub archived: bool,
+    /// The Mission (user task) this thread belongs to, if any. `None` for
+    /// threads created before Missions existed, or standalone threads that
+    /// were never grouped under one.
+    pub mission_id: Option<MissionId>,
+    /// Free-form role label assigned to this thread within its Mission
+    /// (e.g. "architecture", "coding", "testing"). Not tied to a fixed enum.
+    pub role: Option<String>,
 }
 
 impl ThreadMetadata {
@@ -654,6 +721,16 @@ impl ThreadMetadataStore {
             .filter(move |s| s.matches_remote_connection(remote_connection))
     }
 
+    /// Returns all thread metadata (including archived) associated with the
+    /// given Mission, regardless of agent/harness.
+    pub fn entries_for_mission(
+        &self,
+        mission_id: MissionId,
+    ) -> impl Iterator<Item = &ThreadMetadata> + '_ {
+        self.entries()
+            .filter(move |thread| thread.mission_id == Some(mission_id))
+    }
+
     fn reload(&mut self, cx: &mut Context<Self>) -> Shared<Task<()>> {
         let db = self.db.clone();
         self.reload_task.take();
@@ -736,6 +813,56 @@ impl ThreadMetadataStore {
             ..existing.clone()
         };
         self.save(metadata, cx);
+    }
+
+    /// Associates a thread with a Mission and/or assigns it a role label
+    /// within that Mission. Passing `None` for `mission_id` clears the
+    /// association (e.g. to remove a thread from a Mission).
+    pub fn set_thread_mission(
+        &mut self,
+        thread_id: ThreadId,
+        mission_id: Option<MissionId>,
+        role: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(existing) = self.entry(thread_id) else {
+            return;
+        };
+        if existing.mission_id == mission_id && existing.role == role {
+            return;
+        }
+        let metadata = ThreadMetadata {
+            mission_id,
+            role,
+            ..existing.clone()
+        };
+        self.save(metadata, cx);
+    }
+
+    /// Creates and persists a new Mission.
+    pub fn create_mission(&self, title: String, cx: &App) -> Task<anyhow::Result<Mission>> {
+        let db = self.db.clone();
+        cx.background_spawn(async move {
+            let mission = Mission {
+                id: MissionId::new(),
+                title,
+                created_at: Utc::now(),
+            };
+            db.create_mission(&mission).await?;
+            Ok(mission)
+        })
+    }
+
+    /// Returns the Mission with the given id, if it exists.
+    pub fn get_mission(&self, mission_id: MissionId, cx: &App) -> Task<anyhow::Result<Option<Mission>>> {
+        let db = self.db.clone();
+        cx.background_spawn(async move { db.get_mission(mission_id).await })
+    }
+
+    /// Returns all known Missions, most recently created first.
+    pub fn list_missions(&self, cx: &App) -> Task<anyhow::Result<Vec<Mission>>> {
+        let db = self.db.clone();
+        cx.background_spawn(async move { db.list_missions() })
     }
 
     fn save_internal(&mut self, metadata: ThreadMetadata) {
@@ -1290,6 +1417,8 @@ impl ThreadMetadataStore {
         };
         let title = thread_ref.title();
         let title_override = existing_thread.and_then(|t| t.title_override.clone());
+        let mission_id = existing_thread.and_then(|t| t.mission_id);
+        let role = existing_thread.and_then(|t| t.role.clone());
 
         let updated_at = Utc::now();
 
@@ -1350,6 +1479,8 @@ impl ThreadMetadataStore {
             worktree_paths,
             remote_connection,
             archived,
+            mission_id,
+            role,
         };
 
         self.save(metadata, cx);
@@ -1462,6 +1593,16 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
         ),
+        sql!(
+            CREATE TABLE IF NOT EXISTS missions(
+                id BLOB PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            ) STRICT;
+
+            ALTER TABLE sidebar_threads ADD COLUMN mission_id BLOB;
+            ALTER TABLE sidebar_threads ADD COLUMN role TEXT;
+        ),
     ];
 }
 
@@ -1478,7 +1619,7 @@ impl ThreadMetadataDb {
 
     const LIST_QUERY: &str = "SELECT thread_id, session_id, agent_id, title, updated_at, \
         created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, \
-        main_worktree_paths_order, remote_connection, title_override \
+        main_worktree_paths_order, remote_connection, title_override, mission_id, role \
         FROM sidebar_threads \
         ORDER BY updated_at DESC";
 
@@ -1531,10 +1672,12 @@ impl ThreadMetadataDb {
         let title_override = row.title_override.as_ref().map(|t| t.to_string());
         let thread_id = row.thread_id;
         let archived = row.archived;
+        let mission_id = row.mission_id;
+        let role = row.role.clone();
 
         self.write(move |conn| {
-            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override) \
-                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+            let sql = "INSERT INTO sidebar_threads(thread_id, session_id, agent_id, title, updated_at, created_at, interacted_at, folder_paths, folder_paths_order, archived, main_worktree_paths, main_worktree_paths_order, remote_connection, title_override, mission_id, role) \
+                       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16) \
                        ON CONFLICT(thread_id) DO UPDATE SET \
                            session_id = excluded.session_id, \
                            agent_id = excluded.agent_id, \
@@ -1548,7 +1691,9 @@ impl ThreadMetadataDb {
                            main_worktree_paths = excluded.main_worktree_paths, \
                            main_worktree_paths_order = excluded.main_worktree_paths_order, \
                            remote_connection = excluded.remote_connection, \
-                           title_override = excluded.title_override";
+                           title_override = excluded.title_override, \
+                           mission_id = excluded.mission_id, \
+                           role = excluded.role";
             let mut stmt = Statement::prepare(conn, sql)?;
             let mut i = stmt.bind(&thread_id, 1)?;
             i = stmt.bind(&session_id, i)?;
@@ -1563,10 +1708,42 @@ impl ThreadMetadataDb {
             i = stmt.bind(&main_worktree_paths, i)?;
             i = stmt.bind(&main_worktree_paths_order, i)?;
             i = stmt.bind(&remote_connection, i)?;
-            stmt.bind(&title_override, i)?;
+            i = stmt.bind(&title_override, i)?;
+            i = stmt.bind(&mission_id, i)?;
+            stmt.bind(&role, i)?;
             stmt.exec()
         })
         .await
+    }
+
+    /// Insert a new Mission.
+    pub async fn create_mission(&self, mission: &Mission) -> anyhow::Result<()> {
+        let id = mission.id;
+        let title = mission.title.clone();
+        let created_at = mission.created_at.to_rfc3339();
+        self.write(move |conn| {
+            let mut stmt = Statement::prepare(
+                conn,
+                "INSERT INTO missions(id, title, created_at) VALUES (?1, ?2, ?3)",
+            )?;
+            let mut i = stmt.bind(&id, 1)?;
+            i = stmt.bind(&title, i)?;
+            stmt.bind(&created_at, i)?;
+            stmt.exec()
+        })
+        .await
+    }
+
+    /// Returns the Mission with the given id, if it exists.
+    pub async fn get_mission(&self, mission_id: MissionId) -> anyhow::Result<Option<Mission>> {
+        self.select_row_bound::<MissionId, Mission>(
+            "SELECT id, title, created_at FROM missions WHERE id = ?1",
+        )?(mission_id)
+    }
+
+    /// List all Missions, most recently created first.
+    pub fn list_missions(&self) -> anyhow::Result<Vec<Mission>> {
+        self.select::<Mission>("SELECT id, title, created_at FROM missions ORDER BY created_at DESC")?()
     }
 
     /// Delete metadata for a single thread.
@@ -1721,6 +1898,8 @@ impl Column for ThreadMetadata {
         let (remote_connection_json, next): (Option<String>, i32) =
             Column::column(statement, next)?;
         let (title_override, next): (Option<String>, i32) = Column::column(statement, next)?;
+        let (mission_id, next): (Option<MissionId>, i32) = Column::column(statement, next)?;
+        let (role, next): (Option<String>, i32) = Column::column(statement, next)?;
 
         let agent_id = agent_id
             .map(|id| AgentId::new(id))
@@ -1787,6 +1966,8 @@ impl Column for ThreadMetadata {
                 worktree_paths,
                 remote_connection,
                 archived,
+                mission_id,
+                role,
             },
             next,
         ))
@@ -1877,6 +2058,8 @@ mod tests {
             interacted_at: None,
             worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
             remote_connection: None,
+            mission_id: None,
+            role: None,
         }
     }
 
@@ -2171,6 +2354,8 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&second_paths),
             remote_connection: None,
             archived: false,
+            mission_id: None,
+            role: None,
         };
 
         cx.update(|cx| {
@@ -2256,6 +2441,8 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&project_a_paths),
             remote_connection: None,
             archived: false,
+            mission_id: None,
+            role: None,
         };
 
         cx.update(|cx| {
@@ -2382,6 +2569,8 @@ mod tests {
             worktree_paths: WorktreePaths::from_folder_paths(&project_paths),
             remote_connection: None,
             archived: false,
+            mission_id: None,
+            role: None,
         };
 
         cx.update(|cx| {
@@ -3126,6 +3315,8 @@ mod tests {
             interacted_at: None,
             worktree_paths: linked_worktree_paths.clone(),
             remote_connection: None,
+            mission_id: None,
+            role: None,
         };
 
         let remote_linked_thread = ThreadMetadata {
@@ -3140,6 +3331,8 @@ mod tests {
             interacted_at: None,
             worktree_paths: linked_worktree_paths,
             remote_connection: Some(remote_a.clone()),
+            mission_id: None,
+            role: None,
         };
 
         cx.update(|cx| {
@@ -4269,5 +4462,229 @@ mod tests {
                 "retained thread A's stored path must not be updated while the project is via collab"
             );
         });
+    }
+
+    // ── Mission metadata tests ─────────────────────────────────────────
+
+    #[gpui::test]
+    async fn test_database_round_trips_mission_and_role(_cx: &mut TestAppContext) {
+        let mission_id = MissionId::new();
+        let mut metadata = make_metadata(
+            "session-1",
+            "Agent Generated Title",
+            Utc::now(),
+            PathList::new(&[Path::new("/project-a")]),
+        );
+        metadata.mission_id = Some(mission_id);
+        metadata.role = Some("coding".to_string());
+
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+
+        db.save(metadata).await.unwrap();
+
+        let rows = db.list().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].mission_id, Some(mission_id));
+        assert_eq!(rows[0].role.as_deref(), Some("coding"));
+    }
+
+    #[gpui::test]
+    async fn test_database_round_trips_mission(_cx: &mut TestAppContext) {
+        let thread = std::thread::current();
+        let test_name = thread.name().unwrap_or("unknown_test");
+        let db_name = format!("THREAD_METADATA_DB_{}", test_name);
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
+            &db_name,
+        )));
+
+        let mission = Mission {
+            id: MissionId::new(),
+            title: "Ship the Mission feature".to_string(),
+            created_at: Utc::now(),
+        };
+        db.create_mission(&mission).await.unwrap();
+
+        let fetched = db.get_mission(mission.id).await.unwrap();
+        assert_eq!(fetched, Some(mission.clone()));
+
+        let all = db.list_missions().unwrap();
+        assert_eq!(all, vec![mission]);
+
+        let missing = db.get_mission(MissionId::new()).await.unwrap();
+        assert_eq!(missing, None);
+    }
+
+    #[gpui::test]
+    async fn test_store_set_thread_mission_and_entries_for_mission(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let mission_id = MissionId::new();
+        let architecture_thread = make_metadata(
+            "session-arch",
+            "Design the schema",
+            Utc::now(),
+            PathList::default(),
+        );
+        let coding_thread = make_metadata(
+            "session-code",
+            "Implement the schema",
+            Utc::now(),
+            PathList::default(),
+        );
+        let unrelated_thread = make_metadata(
+            "session-unrelated",
+            "Totally unrelated thread",
+            Utc::now(),
+            PathList::default(),
+        );
+        let architecture_id = architecture_thread.thread_id;
+        let coding_id = coding_thread.thread_id;
+        let unrelated_id = unrelated_thread.thread_id;
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            store.update(cx, |store, cx| {
+                store.save(architecture_thread, cx);
+                store.save(coding_thread, cx);
+                store.save(unrelated_thread, cx);
+                store.set_thread_mission(
+                    architecture_id,
+                    Some(mission_id),
+                    Some("architecture".to_string()),
+                    cx,
+                );
+                store.set_thread_mission(
+                    coding_id,
+                    Some(mission_id),
+                    Some("coding".to_string()),
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+
+            let mut mission_threads: Vec<_> = store
+                .entries_for_mission(mission_id)
+                .map(|t| (t.thread_id, t.role.clone()))
+                .collect();
+            mission_threads.sort_by_key(|(_, role)| role.clone());
+            let mut expected = vec![
+                (architecture_id, Some("architecture".to_string())),
+                (coding_id, Some("coding".to_string())),
+            ];
+            expected.sort_by_key(|(_, role)| role.clone());
+            assert_eq!(mission_threads, expected);
+
+            // The unrelated thread was never assigned a Mission and must not
+            // show up here, and must keep reading back as unassigned.
+            assert!(
+                store
+                    .entries_for_mission(mission_id)
+                    .all(|t| t.thread_id != unrelated_id)
+            );
+            let unrelated = store.entry(unrelated_id).unwrap();
+            assert_eq!(unrelated.mission_id, None);
+            assert_eq!(unrelated.role, None);
+
+            // Querying an unused Mission id returns nothing.
+            assert_eq!(store.entries_for_mission(MissionId::new()).count(), 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_store_create_and_list_missions(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let mission = cx
+            .update(|cx| {
+                let store = ThreadMetadataStore::global(cx);
+                store.read(cx).create_mission("Ship the feature".to_string(), cx)
+            })
+            .await
+            .unwrap();
+
+        let fetched = cx
+            .update(|cx| {
+                let store = ThreadMetadataStore::global(cx);
+                store.read(cx).get_mission(mission.id, cx)
+            })
+            .await
+            .unwrap();
+        assert_eq!(fetched, Some(mission.clone()));
+
+        let all = cx
+            .update(|cx| {
+                let store = ThreadMetadataStore::global(cx);
+                store.read(cx).list_missions(cx)
+            })
+            .await
+            .unwrap();
+        assert_eq!(all, vec![mission]);
+    }
+
+    #[test]
+    fn test_mission_migration_preserves_existing_threads_with_null_mission_and_role() {
+        use db::sqlez::connection::Connection;
+
+        let connection = Connection::open_memory(Some(
+            "test_mission_migration_preserves_existing_threads",
+        ));
+
+        // Run every migration except the one that introduces `missions` and
+        // the `mission_id`/`role` columns, simulating an already-existing
+        // database from before Missions existed.
+        let old_migrations = &ThreadMetadataDb::MIGRATIONS[..ThreadMetadataDb::MIGRATIONS.len() - 1];
+        connection
+            .migrate(ThreadMetadataDb::NAME, old_migrations, &mut |_, _, _| false)
+            .expect("pre-mission migrations should succeed");
+
+        connection
+            .exec(
+                "INSERT INTO sidebar_threads \
+                 (thread_id, session_id, title, updated_at) \
+                 VALUES (X'0102030405060708090A0B0C0D0E0F10', 'pre-existing', 'Pre-existing Thread', '2025-01-01T00:00:00Z')",
+            )
+            .unwrap()()
+            .unwrap();
+
+        // Running the remaining (mission) migration on top of pre-existing
+        // data must succeed and must not disturb the existing row.
+        run_thread_metadata_migrations(&connection);
+
+        let rows = list_thread_metadata_from_connection(&connection).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].display_title(), "Pre-existing Thread");
+        assert_eq!(
+            rows[0].mission_id, None,
+            "pre-existing threads must read back with no Mission association"
+        );
+        assert_eq!(
+            rows[0].role, None,
+            "pre-existing threads must read back with no role"
+        );
+    }
+
+    #[test]
+    fn test_mission_migration_runs_on_empty_database() {
+        use db::sqlez::connection::Connection;
+
+        let connection = Connection::open_memory(Some("test_mission_migration_empty_database"));
+        run_thread_metadata_migrations(&connection);
+
+        let count: i64 = connection
+            .select_row_bound::<(), i64>("SELECT COUNT(*) FROM missions")
+            .unwrap()(())
+        .unwrap()
+        .unwrap();
+        assert_eq!(count, 0);
     }
 }

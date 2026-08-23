@@ -189,6 +189,7 @@ members = [
     "crates/settings_macros",
     "crates/settings_profile_selector",
     "crates/settings_ui",
+    "crates/shared_context",
     "crates/shell_command_parser",
     "crates/sidebar",
     "crates/snippet",
@@ -454,6 +455,7 @@ settings_json = { path = "crates/settings_json" }
 settings_macros = { path = "crates/settings_macros" }
 settings_profile_selector = { path = "crates/settings_profile_selector" }
 settings_ui = { path = "crates/settings_ui" }
+shared_context = { path = "crates/shared_context" }
 shell_command_parser = { path = "crates/shell_command_parser" }
 sidebar = { path = "crates/sidebar" }
 snippet = { path = "crates/snippet" }

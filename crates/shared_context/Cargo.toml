@@ -1,0 +1,31 @@
+[package]
+name = "shared_context"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/shared_context.rs"
+
+[[bin]]
+name = "shared-context-mcp"
+path = "src/bin/shared_context_mcp.rs"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+collections.workspace = true
+paths.workspace = true
+pollster.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlez.workspace = true
+sqlez_macros.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -879,6 +879,16 @@ fn ensure_agent_panel_for_workspace(
     })
 }
 
+fn ensure_mission_panel_for_workspace(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Task<anyhow::Result<()>> {
+    setup_or_teardown_ai_panel(workspace, window, cx, move |workspace, cx| {
+        agent_ui::MissionPanel::load(workspace, cx)
+    })
+}
+
 async fn initialize_agent_panel(
     workspace_handle: WeakEntity<Workspace>,
     mut cx: AsyncWindowContext,
@@ -888,10 +898,16 @@ async fn initialize_agent_panel(
             ensure_agent_panel_for_workspace(workspace, None, window, cx)
         })?
         .await?;
+    workspace_handle
+        .update_in(&mut cx, |workspace, window, cx| {
+            ensure_mission_panel_for_workspace(workspace, window, cx)
+        })?
+        .await?;
 
     workspace_handle.update_in(&mut cx, |workspace, window, cx| {
         cx.observe_global_in::<SettingsStore>(window, move |workspace, window, cx| {
             ensure_agent_panel_for_workspace(workspace, None, window, cx).detach_and_log_err(cx);
+            ensure_mission_panel_for_workspace(workspace, window, cx).detach_and_log_err(cx);
         })
         .detach();
 
@@ -906,6 +922,7 @@ async fn initialize_agent_panel(
                 .register_action(agent_ui::AgentPanel::toggle_focus)
                 .register_action(agent_ui::AgentPanel::focus)
                 .register_action(agent_ui::AgentPanel::toggle)
+                .register_action(agent_ui::MissionPanel::toggle_focus)
                 .register_action(agent_ui::InlineAssistant::inline_assist);
         }
     })?;

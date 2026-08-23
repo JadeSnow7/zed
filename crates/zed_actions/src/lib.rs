@@ -981,6 +981,18 @@ pub mod notebook {
     );
 }
 
+pub mod mission_panel {
+    use gpui::actions;
+
+    actions!(
+        mission_panel,
+        [
+            /// Toggles focus on the Mission panel.
+            ToggleFocus,
+        ]
+    );
+}
+
 pub mod git_panel {
     use gpui::actions;
 

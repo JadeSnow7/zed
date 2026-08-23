@@ -612,6 +612,7 @@ pub struct ConversationView {
     /// Shared with the child [`ThreadView`] when one is constructed.
     pub(crate) code_span_resolver: AgentCodeSpanResolver,
     request_elicitation_form_states: HashMap<ElicitationEntryId, ElicitationFormState>,
+    mission_observer: crate::mission_context_observer::ObserverState,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -889,6 +890,7 @@ impl ConversationView {
             draft_prompt_persist_task: None,
             code_span_resolver,
             request_elicitation_form_states: HashMap::default(),
+            mission_observer: crate::mission_context_observer::ObserverState::default(),
             _subscriptions: subscriptions,
             focus_handle: cx.focus_handle(),
         }
@@ -1592,6 +1594,13 @@ impl ConversationView {
             AcpThreadEvent::NewEntry => {
                 let len = thread.read(cx).entries().len();
                 let index = len - 1;
+                crate::mission_context_observer::observe_entry(
+                    &mut self.mission_observer,
+                    self.thread_id,
+                    thread,
+                    index,
+                    cx,
+                );
                 if let Some(active) = self.thread_view(&session_id) {
                     let entry_view_state = active.read(cx).entry_view_state.clone();
                     let list_state = active.read(cx).list_state.clone();
@@ -1612,6 +1621,13 @@ impl ConversationView {
                 }
             }
             AcpThreadEvent::EntryUpdated(index) => {
+                crate::mission_context_observer::observe_entry(
+                    &mut self.mission_observer,
+                    self.thread_id,
+                    thread,
+                    *index,
+                    cx,
+                );
                 if let Some(active) = self.thread_view(&session_id) {
                     let entry_view_state = active.read(cx).entry_view_state.clone();
                     let list_state = active.read(cx).list_state.clone();
@@ -4671,6 +4687,8 @@ pub(crate) mod tests {
                         worktree_paths: WorktreePaths::from_folder_paths(&PathList::default()),
                         remote_connection: None,
                         archived: false,
+                        mission_id: None,
+                        role: None,
                     },
                     cx,
                 );

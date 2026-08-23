@@ -20,6 +20,9 @@ mod inline_prompt_editor;
 mod language_model_selector;
 mod mention_set;
 mod message_editor;
+pub mod mission_context_observer;
+mod mission_orchestrator;
+mod mission_panel;
 mod mode_selector;
 mod model_selector;
 mod model_selector_popover;
@@ -71,8 +74,8 @@ use workspace::{OpenOptions, Workspace};
 use crate::agent_configuration::ManageProfilesModal;
 pub use crate::agent_connection_store::{ActiveAcpConnection, AgentConnectionStore};
 pub use crate::agent_panel::{
-    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, MaxIdleRetainedThreads, TerminalId,
-    ThreadTitleRegenerationResult,
+    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, CreateThreadOptions,
+    MaxIdleRetainedThreads, TerminalId, ThreadTitleRegenerationResult,
 };
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
@@ -82,6 +85,10 @@ pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
 pub use conversation_view::open_markdown_in_workspace;
 pub use conversation_view::{ConversationView, StateChange};
 pub use external_source_prompt::ExternalSourcePrompt;
+pub use mission_orchestrator::{
+    MissionState, MissionThreadState, aggregate_mission_state, mission_state, thread_mission_state,
+};
+pub use mission_panel::MissionPanel;
 pub(crate) use mode_selector::ModeSelector;
 pub(crate) use model_selector::ModelSelector;
 pub(crate) use model_selector_popover::ModelSelectorPopover;
@@ -191,6 +198,7 @@ pub enum AgentThreadSource {
     AgentPanel,
     GitPanel,
     Sidebar,
+    MissionPanel,
 }
 
 impl AgentThreadSource {
@@ -199,6 +207,7 @@ impl AgentThreadSource {
             Self::AgentPanel => "agent_panel",
             Self::GitPanel => "git_panel",
             Self::Sidebar => "sidebar",
+            Self::MissionPanel => "mission_panel",
         }
     }
 }
@@ -326,6 +335,8 @@ actions!(
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
+        /// Creates a Mission and starts the selected Harness threads.
+        CreateMission,
     ]
 );
 
@@ -617,6 +628,7 @@ pub fn init(
     context_server_configuration::init(language_registry, fs.clone(), cx);
     thread_metadata_store::init(cx);
     terminal_thread_metadata_store::init(cx);
+    mission_context_observer::init(cx);
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
     terminal_inline_assistant::init(fs.clone(), prompt_builder, cx);
@@ -653,6 +665,17 @@ pub fn init(
     })
     .detach();
     cx.observe_new(ManageProfilesModal::register).detach();
+    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
+        workspace.register_action(
+            |workspace: &mut Workspace,
+             _: &CreateMission,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                mission_orchestrator::show_create_mission_modal(workspace, window, cx);
+            },
+        );
+    })
+    .detach();
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(
             |workspace: &mut Workspace,
