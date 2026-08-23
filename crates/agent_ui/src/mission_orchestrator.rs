@@ -1,0 +1,631 @@
+use std::sync::Arc;
+
+use acp_thread::{AcpThread, AgentThreadEntry, ThreadStatus, ToolCallStatus};
+use agent_client_protocol::schema::v1 as acp;
+use editor::Editor;
+use fs::Fs;
+use gpui::{
+    App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Render, SharedString,
+    WeakEntity, Window,
+};
+use project::AgentServerStore;
+use settings::{ContextServerSettingsContent, ProjectSettingsContent, update_settings_file};
+use ui::{
+    Button, Checkbox, Color, KeyBinding, Label, LabelSize, ListItem, ListItemSpacing, Modal,
+    ModalFooter, ModalHeader, Section, ToggleState, prelude::*,
+};
+use workspace::{ModalView, Workspace};
+
+use crate::{
+    Agent, AgentInitialContent, AgentPanel, AgentThreadSource, CreateThreadOptions,
+    conversation_view::RootThreadUpdated,
+    thread_metadata_store::{Mission, MissionId, ThreadMetadataStore},
+};
+
+const SHARED_CONTEXT_SERVER_ID: &str = "shared-context";
+const SHARED_CONTEXT_SERVER_COMMAND: &str = "shared-context-mcp";
+
+/// Aggregated state of all threads assigned to a Mission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MissionState {
+    Created,
+    Running,
+    Waiting,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MissionThreadState {
+    Created,
+    Running,
+    Waiting,
+    Completed,
+    Failed,
+}
+
+/// Aggregates thread states with failures first, then user-blocked work, active work,
+/// unstarted work, and finally all-completed work.
+pub fn aggregate_mission_state(
+    thread_states: impl IntoIterator<Item = MissionThreadState>,
+) -> MissionState {
+    let thread_states = thread_states.into_iter().collect::<Vec<_>>();
+    if thread_states.is_empty()
+        || thread_states
+            .iter()
+            .any(|state| *state == MissionThreadState::Created)
+    {
+        return if thread_states.is_empty() {
+            MissionState::Created
+        } else if thread_states
+            .iter()
+            .any(|state| *state == MissionThreadState::Failed)
+        {
+            MissionState::Failed
+        } else if thread_states
+            .iter()
+            .any(|state| *state == MissionThreadState::Waiting)
+        {
+            MissionState::Waiting
+        } else if thread_states
+            .iter()
+            .any(|state| *state == MissionThreadState::Running)
+        {
+            MissionState::Running
+        } else {
+            MissionState::Created
+        };
+    }
+    if thread_states
+        .iter()
+        .any(|state| *state == MissionThreadState::Failed)
+    {
+        MissionState::Failed
+    } else if thread_states
+        .iter()
+        .any(|state| *state == MissionThreadState::Waiting)
+    {
+        MissionState::Waiting
+    } else if thread_states
+        .iter()
+        .any(|state| *state == MissionThreadState::Running)
+    {
+        MissionState::Running
+    } else {
+        MissionState::Completed
+    }
+}
+
+/// Derives a Mission state from the live `AcpThread` entities held by an `AgentPanel`.
+pub fn mission_state(panel: &AgentPanel, mission_id: MissionId, cx: &App) -> MissionState {
+    let Some(metadata_store) = ThreadMetadataStore::try_global(cx) else {
+        return MissionState::Created;
+    };
+
+    let thread_states = metadata_store
+        .read(cx)
+        .entries()
+        .filter(|metadata| metadata.mission_id == Some(mission_id))
+        .map(|metadata| {
+            let Some(view) = panel.conversation_view_for_id(&metadata.thread_id, cx) else {
+                return MissionThreadState::Created;
+            };
+            let Some(thread) = view.read(cx).root_thread(cx) else {
+                return MissionThreadState::Created;
+            };
+            thread_state(thread.read(cx))
+        });
+
+    aggregate_mission_state(thread_states)
+}
+
+fn thread_state(thread: &AcpThread) -> MissionThreadState {
+    if thread.had_error()
+        || thread.entries().iter().any(|entry| {
+            matches!(
+                entry,
+                AgentThreadEntry::ToolCall(call)
+                    if matches!(call.status, ToolCallStatus::Failed | ToolCallStatus::Rejected)
+            )
+        })
+    {
+        MissionThreadState::Failed
+    } else if thread.is_waiting_for_confirmation() {
+        MissionThreadState::Waiting
+    } else if thread.status() == ThreadStatus::Generating {
+        MissionThreadState::Running
+    } else if thread.entries().is_empty() || thread.is_draft_thread() {
+        MissionThreadState::Created
+    } else {
+        MissionThreadState::Completed
+    }
+}
+
+pub(crate) fn ensure_shared_context_server(settings: &mut ProjectSettingsContent) -> bool {
+    if settings
+        .context_servers
+        .contains_key(SHARED_CONTEXT_SERVER_ID)
+    {
+        return false;
+    }
+
+    settings.context_servers.insert(
+        SHARED_CONTEXT_SERVER_ID.into(),
+        ContextServerSettingsContent::Stdio {
+            enabled: true,
+            remote: false,
+            command: context_server::ContextServerCommand {
+                path: SHARED_CONTEXT_SERVER_COMMAND.into(),
+                args: Vec::new(),
+                env: None,
+                timeout: None,
+            },
+        },
+    );
+    true
+}
+
+fn register_shared_context_server(fs: Arc<dyn Fs>, cx: &mut App) {
+    update_settings_file(fs, cx, |settings, _| {
+        ensure_shared_context_server(&mut settings.project);
+    });
+}
+
+fn mission_prompt(mission: &Mission, role: &str) -> String {
+    format!(
+        r#"<zed-mission-context>
+mission_id: {}
+title: {}
+role: {}
+shared_context: "Use record_decision, record_artifact, record_evidence, and get_mission_context with this mission_id when sharing information across Harnesses."
+</zed-mission-context>"#,
+        mission.id.to_key_string(),
+        mission.title,
+        role,
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MissionThreadSpec {
+    agent: Agent,
+    role: String,
+}
+
+fn selected_thread_specs(entries: &[MissionAgentEntry], cx: &App) -> Vec<MissionThreadSpec> {
+    entries
+        .iter()
+        .filter(|entry| entry.selected)
+        .map(|entry| MissionThreadSpec {
+            agent: entry.agent.clone(),
+            role: entry.role_editor.read(cx).text(cx).trim().to_string(),
+        })
+        .filter(|entry| !entry.role.is_empty())
+        .collect()
+}
+
+#[derive(Clone)]
+struct MissionAgentEntry {
+    agent: Agent,
+    label: SharedString,
+    selected: bool,
+    role_editor: Entity<Editor>,
+}
+
+pub struct MissionOrchestratorModal {
+    focus_handle: FocusHandle,
+    panel: WeakEntity<AgentPanel>,
+    fs: Arc<dyn Fs>,
+    title_editor: Entity<Editor>,
+    agents: Vec<MissionAgentEntry>,
+    selected_index: Option<usize>,
+    creating: bool,
+    error: Option<SharedString>,
+}
+
+impl MissionOrchestratorModal {
+    pub fn new(
+        panel: WeakEntity<AgentPanel>,
+        fs: Arc<dyn Fs>,
+        agent_server_store: Entity<AgentServerStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let title_editor = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_placeholder_text("Mission title", window, cx);
+            editor
+        });
+
+        let mut agents = vec![MissionAgentEntry {
+            agent: Agent::NativeAgent,
+            label: "Zed Agent".into(),
+            selected: true,
+            role_editor: cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_text("Zed Agent", window, cx);
+                editor
+            }),
+        }];
+
+        let external_agents = {
+            let store = agent_server_store.read(cx);
+            store
+                .external_agents()
+                .map(|agent_id| {
+                    (
+                        agent_id.clone(),
+                        store
+                            .agent_display_name(agent_id)
+                            .unwrap_or_else(|| agent_id.0.clone().into()),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for (agent_id, label) in external_agents {
+            let role_editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_text(label.clone(), window, cx);
+                editor
+            });
+            agents.push(MissionAgentEntry {
+                agent: Agent::Custom { id: agent_id },
+                label,
+                selected: false,
+                role_editor,
+            });
+        }
+
+        Self {
+            focus_handle: cx.focus_handle(),
+            panel,
+            fs,
+            title_editor,
+            agents,
+            selected_index: Some(0),
+            creating: false,
+            error: None,
+        }
+    }
+
+    fn toggle_selected_agent(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.creating {
+            return;
+        }
+        if let Some(entry) = self.agents.get_mut(index) {
+            entry.selected = !entry.selected;
+            cx.notify();
+        }
+    }
+
+    fn select_next(&mut self, _: &menu::SelectNext, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.agents.is_empty() {
+            return;
+        }
+        self.selected_index = Some(match self.selected_index {
+            Some(index) if index + 1 < self.agents.len() => index + 1,
+            _ => 0,
+        });
+        cx.notify();
+    }
+
+    fn select_previous(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agents.is_empty() {
+            return;
+        }
+        self.selected_index = Some(match self.selected_index {
+            Some(index) if index > 0 => index - 1,
+            _ => self.agents.len() - 1,
+        });
+        cx.notify();
+    }
+
+    fn confirm_selection(
+        &mut self,
+        _: &menu::Confirm,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self.selected_index {
+            self.toggle_selected_agent(index, cx);
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DismissEvent);
+    }
+
+    fn create_mission(
+        &mut self,
+        _: &menu::SecondaryConfirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.creating {
+            return;
+        }
+
+        let title = self.title_editor.read(cx).text(cx).trim().to_string();
+        let specs = selected_thread_specs(&self.agents, cx);
+        if title.is_empty() {
+            self.error = Some("Enter a Mission title.".into());
+            cx.notify();
+            return;
+        }
+        if specs.is_empty() {
+            self.error = Some("Select at least one Harness and provide a role.".into());
+            cx.notify();
+            return;
+        }
+
+        register_shared_context_server(self.fs.clone(), cx);
+        self.creating = true;
+        self.error = None;
+
+        let create_task = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .create_mission(title, cx);
+        let panel = self.panel.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let mission = match create_task.await {
+                Ok(mission) => mission,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        this.creating = false;
+                        this.error = Some(format!("Could not create Mission: {error:#}").into());
+                        cx.notify();
+                    })?;
+                    return anyhow::Ok(());
+                }
+            };
+
+            this.update_in(cx, |_, window, cx| {
+                let Some(panel) = panel.upgrade() else {
+                    return;
+                };
+                panel.update(cx, |panel, cx| {
+                    for spec in specs {
+                        let prompt = mission_prompt(&mission, &spec.role);
+                        let thread_id = panel.create_thread_with_options(
+                            CreateThreadOptions {
+                                title: Some(mission.title.clone().into()),
+                                initial_content: Some(AgentInitialContent::ContentBlock {
+                                    blocks: vec![acp::ContentBlock::Text(acp::TextContent::new(
+                                        prompt,
+                                    ))],
+                                    auto_submit: true,
+                                }),
+                                agent: Some(spec.agent),
+                                ..CreateThreadOptions::default()
+                            },
+                            AgentThreadSource::AgentPanel,
+                            window,
+                            cx,
+                        );
+                        if let Some(view) = panel.conversation_view_for_id(&thread_id, cx).cloned()
+                        {
+                            let role = spec.role.clone();
+                            cx.subscribe(
+                                &view,
+                                move |_panel, _view, _event: &RootThreadUpdated, cx| {
+                                    let role = role.clone();
+                                    cx.defer(move |cx| {
+                                        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                                            store.set_thread_mission(
+                                                thread_id,
+                                                Some(mission.id),
+                                                Some(role),
+                                                cx,
+                                            );
+                                        });
+                                    });
+                                },
+                            )
+                            .detach();
+                        }
+                        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                            store.set_thread_mission(
+                                thread_id,
+                                Some(mission.id),
+                                Some(spec.role),
+                                cx,
+                            );
+                        });
+                    }
+                });
+                cx.emit(DismissEvent);
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+}
+
+impl EventEmitter<DismissEvent> for MissionOrchestratorModal {}
+
+impl Focusable for MissionOrchestratorModal {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl ModalView for MissionOrchestratorModal {}
+
+impl Render for MissionOrchestratorModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let agent_rows = self
+            .agents
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let checkbox_state = if entry.selected {
+                    ToggleState::Selected
+                } else {
+                    ToggleState::Unselected
+                };
+                let focused = self.selected_index == Some(index);
+                ListItem::new(("mission-agent", index))
+                    .spacing(ListItemSpacing::Sparse)
+                    .focused(focused)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .gap_2()
+                            .child(Checkbox::new(
+                                ("mission-agent-checkbox", index),
+                                checkbox_state,
+                            ))
+                            .child(Label::new(entry.label.clone()).size(LabelSize::Small))
+                            .child(div().flex_1().child(entry.role_editor.clone())),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_selected_agent(index, cx);
+                    }))
+            })
+            .collect::<Vec<_>>();
+
+        v_flex()
+            .id("mission-orchestrator-modal")
+            .key_context("MissionOrchestratorModal")
+            .w(rems(40.))
+            .elevation_3(cx)
+            .overflow_hidden()
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::confirm_selection))
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::create_mission))
+            .child(
+                Modal::new("create-mission", None)
+                    .header(
+                        ModalHeader::new()
+                            .headline("Create Mission")
+                            .description("Choose the Harnesses and roles for this Mission.")
+                            .show_dismiss_button(true),
+                    )
+                    .section(
+                        Section::new()
+                            .child(Label::new("Mission title").size(LabelSize::Small))
+                            .child(
+                                div()
+                                    .mt_1()
+                                    .border_1()
+                                    .rounded_md()
+                                    .child(self.title_editor.clone()),
+                            ),
+                    )
+                    .section(
+                        Section::new()
+                            .child(Label::new("Harnesses and roles").size(LabelSize::Small))
+                            .child(
+                                v_flex()
+                                    .id("mission-agent-list")
+                                    .mt_1()
+                                    .max_h(rems_from_px(320.0_f32))
+                                    .overflow_y_scroll()
+                                    .children(agent_rows),
+                            ),
+                    )
+                    .when_some(self.error.clone(), |this, error| {
+                        this.section(
+                            Section::new().child(
+                                Label::new(error).size(LabelSize::Small).color(Color::Error),
+                            ),
+                        )
+                    })
+                    .footer(
+                        ModalFooter::new().end_slot(
+                            Button::new("create-mission", "Create Mission")
+                                .loading(self.creating)
+                                .disabled(self.creating)
+                                .key_binding(
+                                    KeyBinding::for_action(&menu::SecondaryConfirm, cx)
+                                        .map(|binding| binding.size(rems_from_px(12.0_f32))),
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.create_mission(&menu::SecondaryConfirm, window, cx);
+                                })),
+                        ),
+                    ),
+            )
+    }
+}
+
+pub fn show_create_mission_modal(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+        return;
+    };
+    let project = workspace.project().clone();
+    let agent_server_store = project.read(cx).agent_server_store().clone();
+    let fs = project.read(cx).fs().clone();
+    workspace.toggle_modal(window, cx, |window, cx| {
+        MissionOrchestratorModal::new(panel.downgrade(), fs, agent_server_store, window, cx)
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use settings::ProjectSettingsContent;
+
+    #[test]
+    fn mission_state_aggregation_prioritizes_actionable_states() {
+        assert_eq!(aggregate_mission_state([]), MissionState::Created);
+        assert_eq!(
+            aggregate_mission_state([MissionThreadState::Completed, MissionThreadState::Running]),
+            MissionState::Running
+        );
+        assert_eq!(
+            aggregate_mission_state([MissionThreadState::Completed, MissionThreadState::Waiting]),
+            MissionState::Waiting
+        );
+        assert_eq!(
+            aggregate_mission_state([MissionThreadState::Completed, MissionThreadState::Failed]),
+            MissionState::Failed
+        );
+        assert_eq!(
+            aggregate_mission_state([MissionThreadState::Completed, MissionThreadState::Created]),
+            MissionState::Created
+        );
+        assert_eq!(
+            aggregate_mission_state([MissionThreadState::Completed, MissionThreadState::Completed]),
+            MissionState::Completed
+        );
+    }
+
+    #[test]
+    fn shared_context_server_is_added_only_when_missing() {
+        let mut settings = ProjectSettingsContent::default();
+        assert!(ensure_shared_context_server(&mut settings));
+        assert!(!ensure_shared_context_server(&mut settings));
+        assert_eq!(settings.context_servers.len(), 1);
+        assert!(
+            settings
+                .context_servers
+                .contains_key(SHARED_CONTEXT_SERVER_ID)
+        );
+    }
+
+    #[test]
+    fn mission_prompt_carries_the_identity_and_role() {
+        let mission = Mission {
+            id: MissionId::new(),
+            title: "Ship the feature".to_string(),
+            created_at: chrono::Utc::now(),
+        };
+        let prompt = mission_prompt(&mission, "coding");
+        assert!(prompt.contains(&mission.id.to_key_string()));
+        assert!(prompt.contains("title: Ship the feature"));
+        assert!(prompt.contains("role: coding"));
+        assert!(prompt.contains("get_mission_context"));
+    }
+}

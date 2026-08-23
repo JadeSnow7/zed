@@ -21,6 +21,7 @@ mod language_model_selector;
 mod mention_set;
 mod message_editor;
 pub mod mission_context_observer;
+mod mission_orchestrator;
 mod mode_selector;
 mod model_selector;
 mod model_selector_popover;
@@ -72,8 +73,8 @@ use workspace::{OpenOptions, Workspace};
 use crate::agent_configuration::ManageProfilesModal;
 pub use crate::agent_connection_store::{ActiveAcpConnection, AgentConnectionStore};
 pub use crate::agent_panel::{
-    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, MaxIdleRetainedThreads, TerminalId,
-    ThreadTitleRegenerationResult,
+    AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, CreateThreadOptions,
+    MaxIdleRetainedThreads, TerminalId, ThreadTitleRegenerationResult,
 };
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
@@ -83,6 +84,9 @@ pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
 pub use conversation_view::open_markdown_in_workspace;
 pub use conversation_view::{ConversationView, StateChange};
 pub use external_source_prompt::ExternalSourcePrompt;
+pub use mission_orchestrator::{
+    MissionState, MissionThreadState, aggregate_mission_state, mission_state,
+};
 pub(crate) use mode_selector::ModeSelector;
 pub(crate) use model_selector::ModelSelector;
 pub(crate) use model_selector_popover::ModelSelectorPopover;
@@ -327,6 +331,8 @@ actions!(
         ImportThreadsFromOtherChannels,
         /// Starts a new terminal thread.
         NewTerminalThread,
+        /// Creates a Mission and starts the selected Harness threads.
+        CreateMission,
     ]
 );
 
@@ -655,6 +661,17 @@ pub fn init(
     })
     .detach();
     cx.observe_new(ManageProfilesModal::register).detach();
+    cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
+        workspace.register_action(
+            |workspace: &mut Workspace,
+             _: &CreateMission,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                mission_orchestrator::show_create_mission_modal(workspace, window, cx);
+            },
+        );
+    })
+    .detach();
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(
             |workspace: &mut Workspace,
