@@ -37,7 +37,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Report Apple toolchain
         run: |
@@ -54,7 +54,7 @@ jobs:
           cache-on-failure: true
 
       - name: Cache cargo-bundle (zed's fork, avoids reinstall every run)
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cargo/bin/cargo-bundle
           key: cargo-bundle-v0.6.1-zed-macos-${{ runner.arch }}
@@ -101,7 +101,7 @@ jobs:
 
       - name: Upload DMG as build artifact
         if: always() && steps.locate_dmg.outputs.dmg_path != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: zed-macos-dev-build-${{ github.sha }}
           path: ${{ steps.locate_dmg.outputs.dmg_path }}
