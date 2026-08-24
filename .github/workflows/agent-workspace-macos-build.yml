@@ -25,6 +25,9 @@ concurrency:
   group: macos-build-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   build-and-smoke-check:
     name: Build unsigned macOS app (dev channel) + smoke check
@@ -92,6 +95,25 @@ jobs:
             exit 1
           fi
 
+      - name: Package app bundle
+        id: package_app
+        env:
+          APP_PATH: ${{ steps.locate_app.outputs.app_path }}
+        run: |
+          set -euo pipefail
+          app_zip="$RUNNER_TEMP/zed-dev-${GITHUB_RUN_ID}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$app_zip"
+          test -s "$app_zip"
+          echo "app_zip=$app_zip" >> "$GITHUB_OUTPUT"
+
+      - name: Upload app bundle as build artifact
+        if: always() && steps.package_app.outputs.app_zip != ''
+        uses: actions/upload-artifact@v6
+        with:
+          name: zed-macos-dev-app-${{ github.sha }}
+          path: ${{ steps.package_app.outputs.app_zip }}
+          retention-days: 14
+
       - name: Locate built DMG
         id: locate_dmg
         if: always()
@@ -106,3 +128,28 @@ jobs:
           name: zed-macos-dev-build-${{ github.sha }}
           path: ${{ steps.locate_dmg.outputs.dmg_path }}
           retention-days: 14
+
+      - name: Publish GitHub prerelease
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_ZIP: ${{ steps.package_app.outputs.app_zip }}
+          DMG_PATH: ${{ steps.locate_dmg.outputs.dmg_path }}
+        run: |
+          set -euo pipefail
+          test -f "$APP_ZIP"
+          test -n "$DMG_PATH"
+          test -f "$DMG_PATH"
+          notes=$(cat <<EOF
+          Automated successful macOS dev build.
+
+          Commit: ${GITHUB_SHA}
+          Run: ${GITHUB_RUN_NUMBER} (${GITHUB_RUN_ID})
+          EOF
+          )
+          gh release create "dev-${GITHUB_RUN_ID}" \
+            "$DMG_PATH" "$APP_ZIP" \
+            --target "$GITHUB_SHA" \
+            --title "Zed Dev Build ${GITHUB_RUN_NUMBER}" \
+            --prerelease \
+            --notes "$notes"
