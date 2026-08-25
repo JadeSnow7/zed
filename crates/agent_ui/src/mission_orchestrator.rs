@@ -9,7 +9,9 @@ use gpui::{
     WeakEntity, Window,
 };
 use project::AgentServerStore;
-use settings::{ContextServerSettingsContent, ProjectSettingsContent, update_settings_file};
+use settings::{
+    ContextServerSettingsContent, ProjectSettingsContent, update_settings_file_with_completion,
+};
 use ui::{
     Button, Checkbox, Color, KeyBinding, Label, LabelSize, ListItem, ListItemSpacing, Modal,
     ModalFooter, ModalHeader, Section, ToggleState, prelude::*,
@@ -172,10 +174,13 @@ pub(crate) fn ensure_shared_context_server(settings: &mut ProjectSettingsContent
     true
 }
 
-fn register_shared_context_server(fs: Arc<dyn Fs>, cx: &mut App) {
-    update_settings_file(fs, cx, |settings, _| {
+fn register_shared_context_server(
+    fs: Arc<dyn Fs>,
+    cx: &mut App,
+) -> futures::channel::oneshot::Receiver<anyhow::Result<()>> {
+    update_settings_file_with_completion(fs, cx, |settings, _| {
         ensure_shared_context_server(&mut settings.project);
-    });
+    })
 }
 
 fn mission_prompt(mission: &Mission, role: &str) -> String {
@@ -369,7 +374,7 @@ impl MissionOrchestratorModal {
             return;
         }
 
-        register_shared_context_server(self.fs.clone(), cx);
+        let settings_completion = register_shared_context_server(self.fs.clone(), cx);
         self.creating = true;
         self.error = None;
 
@@ -378,6 +383,19 @@ impl MissionOrchestratorModal {
             .create_mission(title, cx);
         let panel = self.panel.clone();
         cx.spawn_in(window, async move |this, cx| {
+            let settings_result = settings_completion
+                .await
+                .map_err(|error| anyhow::anyhow!("Could not update Mission settings: {error}"))
+                .and_then(|result| result);
+            if let Err(error) = settings_result {
+                this.update(cx, |this, cx| {
+                    this.creating = false;
+                    this.error = Some(format!("Could not create Mission: {error:#}").into());
+                    cx.notify();
+                })?;
+                return anyhow::Ok(());
+            }
+
             let mission = match create_task.await {
                 Ok(mission) => mission,
                 Err(error) => {

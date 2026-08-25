@@ -39,6 +39,7 @@ pub mod thread_worktree_archive;
 pub mod threads_archive_view;
 mod ui;
 mod unicode_confusables;
+mod worker_dashboard;
 
 use std::rc::Rc;
 use std::sync::Arc;
@@ -96,6 +97,7 @@ pub use thread_import::{
     AcpThreadImportOnboarding, CrossChannelImportOnboarding, ThreadImportModal,
     channels_with_threads, import_threads_from_other_channels,
 };
+pub use worker_dashboard::WorkerDashboard;
 use zed_actions;
 pub use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, SwitchWorktree};
 

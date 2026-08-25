@@ -1,26 +1,31 @@
-//! Mission tree + Shared Context panel.
+//! Mission tree + Mission Inspector panel.
 //!
-//! A read-only navigation panel over Missions and their threads
-//! (`thread_metadata_store`) and the Decision/Artifact/Evidence trail
-//! accumulated for the selected Mission (`shared_context`). This panel does
-//! not create Missions or threads (that's `mission_orchestrator`), does not
-//! aggregate Mission/thread state (that's also `mission_orchestrator`, reused
-//! here), and does not duplicate the primary thread list/activation UI in
+//! A navigation panel over Missions and their threads
+//! (`thread_metadata_store`), and an inspector for the selected Mission:
+//! what needs the user's decision, what each worker is doing, which files the
+//! workers have changed, and the Decision/Artifact/Evidence trail
+//! (`shared_context`). This panel does not create Missions or threads (that's
+//! `mission_orchestrator`), does not aggregate Mission/thread state (that's
+//! also `mission_orchestrator`, reused here), does not own the per-worker
+//! runtime view (that's `worker_dashboard`, opened from the Workers section),
+//! and does not duplicate the primary thread list/activation UI in
 //! `crates/sidebar` -- clicking a thread row here calls straight into
 //! `AgentPanel::load_agent_thread`, the same entrypoint the sidebar uses.
 //!
-//! Refresh is pull-based: the tree reloads when the panel becomes active or
-//! when the selected Mission changes, not on a live subscription. Neither
-//! `ThreadMetadataStore` nor `shared_context` currently publish change
-//! events, so a push-based refresh would need new plumbing in both for a
-//! panel whose data changes at the pace of Mission/thread creation and
-//! occasional tool calls -- infrequently enough that this is a deliberate
-//! simplification, not an oversight.
+//! Refresh is pull-based for everything persisted: the tree and the Shared
+//! Context trail reload when the panel becomes active or when the selected
+//! Mission changes, since neither `ThreadMetadataStore` nor `shared_context`
+//! publish change events and both change at the pace of Mission/thread
+//! creation. The exception is the selected Mission's live worker threads,
+//! which the panel observes directly -- "this worker is blocked on a
+//! permission" is useless if it only shows up at the next refresh.
 
+use acp_thread::AcpThread;
 use collections::{HashMap, HashSet};
 use gpui::{
     Action as _, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Pixels, Render, Styled, Task, WeakEntity, Window, div, px,
+    IntoElement, ParentElement, Pixels, Render, SharedString, Styled, Subscription, Task,
+    WeakEntity, Window, div, px,
 };
 use ui::{Color, Icon, IconName, IconSize, Label, LabelSize, ListItem, ListItemSpacing, prelude::*};
 use workspace::{
@@ -34,6 +39,9 @@ use crate::{
     mission_state,
     thread_metadata_store::{Mission, MissionId, ThreadId, ThreadMetadata, ThreadMetadataStore},
     thread_mission_state,
+    worker_dashboard::{
+        PendingPermission, WorkerDashboard, authorize_worker, harness_icon, worker_status,
+    },
 };
 
 const MIN_PANEL_WIDTH: Pixels = px(280.);
@@ -84,6 +92,63 @@ pub fn build_mission_tree(
     MissionTree { groups, ungrouped }
 }
 
+/// One file a Mission's workers changed, aggregated across all of them.
+#[derive(Debug, PartialEq, Eq)]
+pub struct MissionChange {
+    pub name: String,
+    pub lines_added: u32,
+    pub lines_removed: u32,
+    /// Every worker that touched this file, in the order first seen.
+    pub workers: Vec<SharedString>,
+}
+
+impl MissionChange {
+    /// Two workers editing one file is the situation the Mission Inspector
+    /// exists to surface: nothing has gone wrong yet, but the user is the only
+    /// one who can decide who owns the file.
+    pub fn is_contended(&self) -> bool {
+        self.workers.len() > 1
+    }
+}
+
+/// One worker's edit to one file, as read off its `ActionLog`.
+#[derive(Debug)]
+pub struct WorkerFileChange {
+    pub worker: SharedString,
+    pub name: String,
+    pub lines_added: u32,
+    pub lines_removed: u32,
+}
+
+/// Folds each worker's changed files into one per-file view of the Mission,
+/// summing line counts and recording which workers touched each file. Sorted
+/// by name so the panel doesn't reshuffle between renders as workers report
+/// their changes in whatever order `changed_buffers` happens to yield.
+pub fn merge_worker_changes(
+    changes: impl IntoIterator<Item = WorkerFileChange>,
+) -> Vec<MissionChange> {
+    let mut by_name: HashMap<String, MissionChange> = HashMap::default();
+    for change in changes {
+        let entry = by_name
+            .entry(change.name.clone())
+            .or_insert_with(|| MissionChange {
+                name: change.name,
+                lines_added: 0,
+                lines_removed: 0,
+                workers: Vec::new(),
+            });
+        entry.lines_added += change.lines_added;
+        entry.lines_removed += change.lines_removed;
+        if !entry.workers.contains(&change.worker) {
+            entry.workers.push(change.worker);
+        }
+    }
+
+    let mut merged: Vec<_> = by_name.into_values().collect();
+    merged.sort_by(|a, b| a.name.cmp(&b.name));
+    merged
+}
+
 /// What the Context section should show for the currently selected Mission.
 #[derive(Default)]
 enum MissionContextState {
@@ -129,6 +194,10 @@ pub struct MissionPanel {
     selected_thread: Option<ThreadId>,
     context_state: MissionContextState,
     is_active: bool,
+    /// One per live worker thread of the selected Mission, so status badges and
+    /// the attention list track generation rather than waiting for the next
+    /// pull-based refresh. Rebuilt whenever the selected Mission changes.
+    _worker_subscriptions: Vec<Subscription>,
 }
 
 impl MissionPanel {
@@ -143,6 +212,7 @@ impl MissionPanel {
             selected_thread: None,
             context_state: MissionContextState::NoSelection,
             is_active: false,
+            _worker_subscriptions: Vec::new(),
         }
     }
 
@@ -182,6 +252,7 @@ impl MissionPanel {
                 };
                 let threads: Vec<ThreadMetadata> = store.read(cx).entries().cloned().collect();
                 this.tree = build_mission_tree(missions, threads);
+                this.sync_worker_subscriptions(cx);
                 if let Some(mission_id) = this.selected_mission
                     && !this
                         .tree
@@ -234,7 +305,104 @@ impl MissionPanel {
         }
         self.selected_mission = Some(mission_id);
         self.refresh_context(mission_id, cx);
+        self.sync_worker_subscriptions(cx);
         cx.notify();
+    }
+
+    /// The selected Mission's threads, paired with their live `AcpThread` when
+    /// `AgentPanel` currently holds one. A worker with no live thread still
+    /// appears -- it just has no runtime state to show.
+    fn workers(&self, cx: &App) -> Vec<(ThreadMetadata, Option<Entity<AcpThread>>)> {
+        let Some(mission_id) = self.selected_mission else {
+            return Vec::new();
+        };
+        let Some(group) = self
+            .tree
+            .groups
+            .iter()
+            .find(|group| group.mission.id == mission_id)
+        else {
+            return Vec::new();
+        };
+        let panel = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx));
+
+        group
+            .threads
+            .iter()
+            .map(|thread| {
+                let live = panel.as_ref().and_then(|panel| {
+                    panel
+                        .read(cx)
+                        .conversation_view_for_id(&thread.thread_id, cx)?
+                        .read(cx)
+                        .root_thread(cx)
+                });
+                (thread.clone(), live)
+            })
+            .collect()
+    }
+
+    /// Re-observes the selected Mission's live worker threads. Without this the
+    /// inspector would only learn about a worker becoming blocked at the next
+    /// pull-based refresh, which for "what needs me right now?" is too late.
+    fn sync_worker_subscriptions(&mut self, cx: &mut Context<Self>) {
+        self._worker_subscriptions = self
+            .workers(cx)
+            .into_iter()
+            .filter_map(|(_, thread)| thread)
+            .map(|thread| cx.observe(&thread, |_, _, cx| cx.notify()))
+            .collect();
+    }
+
+    fn mission_changes(
+        &self,
+        workers: &[(ThreadMetadata, Option<Entity<AcpThread>>)],
+        cx: &App,
+    ) -> Vec<MissionChange> {
+        let changes = workers.iter().flat_map(|(metadata, thread)| {
+            let worker = worker_label(metadata);
+            let Some(thread) = thread else {
+                return Vec::new();
+            };
+            thread
+                .read(cx)
+                .action_log()
+                .read(cx)
+                .changed_buffers(cx)
+                .filter_map(|(buffer, diff)| {
+                    let path = buffer.read(cx).file()?.path().clone();
+                    let stats = action_log::DiffStats::single_file(diff.read(cx));
+                    Some(WorkerFileChange {
+                        worker: worker.clone(),
+                        name: path
+                            .file_name()
+                            .unwrap_or_else(|| path.as_unix_str())
+                            .to_string(),
+                        lines_added: stats.lines_added,
+                        lines_removed: stats.lines_removed,
+                    })
+                })
+                .collect()
+        });
+
+        merge_worker_changes(changes)
+    }
+
+    /// Opens the worker's runtime dashboard as an editor tab. Distinct from
+    /// `activate_thread`, which switches the agent panel to its conversation.
+    fn open_worker(&mut self, thread: ThreadMetadata, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mission_id) = self.selected_mission else {
+            return;
+        };
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            WorkerDashboard::deploy(mission_id, thread, workspace, window, cx);
+        });
     }
 
     /// Switches the main conversation view to `thread` by calling
@@ -418,6 +586,242 @@ impl MissionPanel {
             .children(rows)
     }
 
+    /// The workers that can't make progress without the user, and the files
+    /// two workers are both editing. Everything else in the panel is status;
+    /// this section is the only part that asks for a decision.
+    fn render_needs_attention(
+        &mut self,
+        workers: &[(ThreadMetadata, Option<Entity<AcpThread>>)],
+        changes: &[MissionChange],
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let blocked: Vec<_> = workers
+            .iter()
+            .cloned()
+            .filter_map(|(metadata, thread)| {
+                let thread = thread?;
+                let permission = PendingPermission::for_thread(thread.read(cx), cx)?;
+                Some((worker_label(&metadata), thread, permission))
+            })
+            .collect();
+        let contended: Vec<_> = changes
+            .iter()
+            .filter(|change| change.is_contended())
+            .collect();
+
+        if blocked.is_empty() && contended.is_empty() {
+            return None;
+        }
+
+        let mut section = v_flex()
+            .gap_2()
+            .p_2()
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(Icon::new(IconName::Warning).size(IconSize::XSmall).color(Color::Warning))
+                    .child(
+                        Label::new("Needs attention")
+                            .size(LabelSize::Small)
+                            .color(Color::Warning),
+                    ),
+            );
+
+        for (worker, thread, permission) in blocked {
+            let allow = permission.allow.clone();
+            let reject = permission.reject.clone();
+            section = section.child(
+                v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().status().warning_border)
+                    .child(Label::new(format!("{worker} is blocked")).size(LabelSize::Small))
+                    .child(
+                        Label::new(permission.label.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .children(allow.map(|option| {
+                                let thread = thread.clone();
+                                let tool_call_id = permission.tool_call_id.clone();
+                                Button::new(
+                                    format!("mission-allow-{}", permission.tool_call_id.0),
+                                    "Allow",
+                                )
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    authorize_worker(
+                                        &thread,
+                                        tool_call_id.clone(),
+                                        option.clone(),
+                                        cx,
+                                    );
+                                }))
+                            }))
+                            .children(reject.map(|option| {
+                                let thread = thread.clone();
+                                let tool_call_id = permission.tool_call_id.clone();
+                                Button::new(
+                                    format!("mission-reject-{}", permission.tool_call_id.0),
+                                    "Reject",
+                                )
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    authorize_worker(
+                                        &thread,
+                                        tool_call_id.clone(),
+                                        option.clone(),
+                                        cx,
+                                    );
+                                }))
+                            })),
+                    ),
+            );
+        }
+
+        for change in contended {
+            section = section.child(
+                v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().status().warning_border)
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .child(
+                                Icon::new(IconName::GitMergeConflict)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Warning),
+                            )
+                            .child(Label::new("Overlapping edit").size(LabelSize::Small)),
+                    )
+                    .child(
+                        Label::new(format!(
+                            "{} touched by {}",
+                            change.name,
+                            change
+                                .workers
+                                .iter()
+                                .map(SharedString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(" and ")
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    ),
+            );
+        }
+
+        Some(section)
+    }
+
+    fn render_workers(
+        &mut self,
+        workers: &[(ThreadMetadata, Option<Entity<AcpThread>>)],
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        if workers.is_empty() {
+            return None;
+        }
+
+        let agent_panel = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx));
+        let store = self
+            .workspace
+            .upgrade()
+            .map(|workspace| workspace.read(cx).project().read(cx).agent_server_store().clone());
+
+        let mut section = v_flex().gap_1().p_2().child(
+            Label::new("Workers")
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        );
+
+        for (metadata, _) in workers {
+            let metadata = metadata.clone();
+            let state = agent_panel
+                .as_ref()
+                .map(|panel| thread_mission_state(panel.read(cx), metadata.thread_id, cx))
+                .unwrap_or(MissionThreadState::Created);
+            let (status_label, status_color) = worker_status(state);
+            let row_id = format!("mission-worker-{}", metadata.thread_id.to_key_string());
+            let for_click = metadata.clone();
+
+            section = section.child(
+                ListItem::new(row_id)
+                    .selectable(true)
+                    .spacing(ListItemSpacing::Sparse)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_worker(for_click.clone(), window, cx);
+                    }))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(harness_icon(&metadata.agent_id, store.as_ref(), cx))
+                            .child(Label::new(worker_label(&metadata)).size(LabelSize::Small))
+                            .child(
+                                Label::new(status_label)
+                                    .size(LabelSize::XSmall)
+                                    .color(status_color),
+                            ),
+                    ),
+            );
+        }
+
+        Some(section)
+    }
+
+    fn render_changes(&mut self, changes: &[MissionChange]) -> Option<impl IntoElement> {
+        if changes.is_empty() {
+            return None;
+        }
+
+        let mut section = v_flex().gap_1().p_2().child(
+            Label::new(format!("Changes · {} files", changes.len()))
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        );
+
+        for change in changes {
+            section = section.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .px_2()
+                    .child(Label::new(change.name.clone()).size(LabelSize::Small))
+                    .when(change.is_contended(), |this| {
+                        this.child(
+                            Icon::new(IconName::GitMergeConflict)
+                                .size(IconSize::XSmall)
+                                .color(Color::Warning),
+                        )
+                    })
+                    .child(
+                        Label::new(format!("+{}", change.lines_added))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Created),
+                    )
+                    .child(
+                        Label::new(format!("-{}", change.lines_removed))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Deleted),
+                    ),
+            );
+        }
+
+        Some(section)
+    }
+
     fn render_context_section(&self) -> impl IntoElement {
         let content: gpui::AnyElement = match &self.context_state {
             MissionContextState::NoSelection => empty_state_label("Select a Mission to see its context."),
@@ -465,6 +869,16 @@ impl MissionPanel {
             .child(Label::new("Context").size(LabelSize::Small).color(Color::Muted))
             .child(content)
     }
+}
+
+/// How a worker is named across the inspector and its dashboard tab: its
+/// Mission role when it has one, its thread title otherwise.
+fn worker_label(metadata: &ThreadMetadata) -> SharedString {
+    metadata
+        .role
+        .clone()
+        .map(SharedString::from)
+        .unwrap_or_else(|| metadata.display_title())
 }
 
 fn empty_state_label(text: &'static str) -> gpui::AnyElement {
@@ -542,6 +956,12 @@ impl Focusable for MissionPanel {
 
 impl Render for MissionPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Read the selected Mission's workers and their changed files once:
+        // three sections below need them, and walking every worker's changed
+        // buffers per section would be the same work repeated.
+        let workers = self.workers(cx);
+        let changes = self.mission_changes(&workers, cx);
+
         v_flex()
             .id("mission-panel")
             .key_context("MissionPanel")
@@ -550,6 +970,9 @@ impl Render for MissionPanel {
             .bg(cx.theme().colors().panel_background)
             .child(self.render_header(cx))
             .child(self.render_tree(cx))
+            .children(self.render_needs_attention(&workers, &changes, cx))
+            .children(self.render_workers(&workers, cx))
+            .children(self.render_changes(&changes))
             .child(self.render_context_section())
     }
 }
@@ -644,6 +1067,69 @@ mod tests {
             mission_id,
             role: role.map(|role| role.to_string()),
         }
+    }
+
+    fn change(worker: &str, name: &str, added: u32, removed: u32) -> WorkerFileChange {
+        WorkerFileChange {
+            worker: worker.into(),
+            name: name.to_string(),
+            lines_added: added,
+            lines_removed: removed,
+        }
+    }
+
+    #[test]
+    fn one_worker_per_file_is_never_contended() {
+        let merged = merge_worker_changes([
+            change("Implementation", "mission_panel.rs", 142, 31),
+            change("Test", "thread_metadata_store.rs", 34, 8),
+        ]);
+
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().all(|change| !change.is_contended()));
+        // Sorted by name, so the panel doesn't reshuffle between renders.
+        assert_eq!(merged[0].name, "mission_panel.rs");
+        assert_eq!(merged[1].name, "thread_metadata_store.rs");
+    }
+
+    #[test]
+    fn two_workers_on_one_file_contend_and_their_line_counts_sum() {
+        let merged = merge_worker_changes([
+            change("Implementation", "mission_panel.rs", 142, 31),
+            change("Review", "mission_panel.rs", 8, 2),
+            change("Review", "shared_context.rs", 21, 6),
+        ]);
+
+        assert_eq!(merged.len(), 2);
+        let contended = &merged[0];
+        assert_eq!(contended.name, "mission_panel.rs");
+        assert!(contended.is_contended());
+        assert_eq!(contended.workers, vec!["Implementation", "Review"]);
+        assert_eq!(contended.lines_added, 150);
+        assert_eq!(contended.lines_removed, 33);
+        assert!(!merged[1].is_contended());
+    }
+
+    #[test]
+    fn a_worker_editing_one_file_twice_is_still_a_single_author() {
+        let merged = merge_worker_changes([
+            change("Implementation", "mission_panel.rs", 10, 1),
+            change("Implementation", "mission_panel.rs", 5, 2),
+        ]);
+
+        assert_eq!(merged.len(), 1);
+        assert!(!merged[0].is_contended());
+        assert_eq!(merged[0].workers, vec!["Implementation"]);
+        assert_eq!(merged[0].lines_added, 15);
+    }
+
+    #[test]
+    fn worker_label_prefers_the_mission_role_over_the_thread_title() {
+        let with_role = thread_with_mission(Some(MissionId::new()), Some("Review"));
+        assert_eq!(worker_label(&with_role), SharedString::from("Review"));
+
+        let without_role = thread_with_mission(Some(MissionId::new()), None);
+        assert_eq!(worker_label(&without_role), without_role.display_title());
     }
 
     #[test]
