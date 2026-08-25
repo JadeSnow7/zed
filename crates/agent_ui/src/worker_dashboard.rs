@@ -18,12 +18,13 @@
 
 use acp_thread::{AcpThread, AgentThreadEntry, ToolCall, ToolCallStatus};
 use agent_client_protocol::schema::v1 as acp;
+use editor::Editor;
 use gpui::{
     AnyElement, App, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Subscription,
     WeakEntity,
 };
 use project::{AgentId, AgentServerStore};
-use ui::{Icon, IconName, Indicator, Tooltip, prelude::*};
+use ui::{ContextMenu, Icon, IconName, Indicator, PopoverMenu, Tooltip, prelude::*};
 use workspace::{
     Workspace,
     item::{Item, ItemEvent, TabContentParams},
@@ -32,6 +33,9 @@ use workspace::{
 use crate::{
     Agent, AgentPanel, AgentThreadSource, MissionThreadState,
     mission_context_observer::shared_context_store,
+    mission_panel::{
+        bilingual_label, format_token_count, last_assistant_summary, send_to_worker, worker_label,
+    },
     thread_metadata_store::{MissionId, ThreadId, ThreadMetadata, ThreadMetadataStore},
     thread_mission_state,
 };
@@ -42,7 +46,7 @@ use crate::{
 /// the permission buttons, and lets the "which sections have content" logic be
 /// tested without standing up a live thread.
 #[derive(Default)]
-pub(crate) struct WorkerSnapshot {
+pub struct WorkerSnapshot {
     /// Whether `AgentPanel` currently holds this worker's thread. When it
     /// doesn't, no runtime state is readable and the tab offers to open it.
     thread_loaded: bool,
@@ -76,7 +80,7 @@ struct ChangedFile {
 /// Answers a worker's pending permission prompt. Free function so
 /// `MissionPanel`'s attention cards and this dashboard's buttons take the
 /// identical path into `AcpThread`.
-pub(crate) fn authorize_worker(
+pub fn authorize_worker(
     thread: &Entity<AcpThread>,
     tool_call_id: acp::ToolCallId,
     option: (acp::PermissionOptionId, acp::PermissionOptionKind),
@@ -125,13 +129,21 @@ fn active_tool_call(thread: &AcpThread) -> Option<&ToolCall> {
     })
 }
 
+/// The label of whatever the worker is executing right now, for surfaces that
+/// only have room for one line of "what is it doing". `MissionPanel`'s worker
+/// rows use this so the sidebar and this tab never describe the same worker
+/// differently.
+pub fn active_tool_call_label(thread: &AcpThread, cx: &App) -> Option<SharedString> {
+    Some(active_tool_call(thread)?.label.read(cx).source().clone())
+}
+
 /// The parts of a pending permission prompt the dashboard renders, copied out
 /// of the thread so the render pass isn't holding a borrow of `cx` through the
 /// `AcpThread` while it needs `&mut Context<Self>` for the button handlers.
 /// `MissionPanel` reuses this so the two surfaces agree on what a worker is
 /// blocked on and what answering it means.
 #[derive(Clone)]
-pub(crate) struct PendingPermission {
+pub struct PendingPermission {
     pub tool_call_id: acp::ToolCallId,
     pub label: SharedString,
     pub allow: Option<(acp::PermissionOptionId, acp::PermissionOptionKind)>,
@@ -139,7 +151,7 @@ pub(crate) struct PendingPermission {
 }
 
 impl PendingPermission {
-    pub(crate) fn for_thread(thread: &AcpThread, cx: &App) -> Option<Self> {
+    pub fn for_thread(thread: &AcpThread, cx: &App) -> Option<Self> {
         Self::from_tool_call(pending_permission(thread)?, cx)
     }
 
@@ -177,10 +189,16 @@ enum WorkerContextState {
 
 pub struct WorkerDashboard {
     mission_id: MissionId,
+    mission_title: SharedString,
     thread_id: ThreadId,
     role: SharedString,
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
+    /// The quick-instruction composer. Sends an ordinary user message to the
+    /// worker's thread; the conversation itself still renders in the agent
+    /// panel, so this tab stays an observation surface with one way in rather
+    /// than a second chat view of the same thread.
+    instruction_editor: Entity<Editor>,
     context_state: WorkerContextState,
     /// The `AcpThread` the runtime sections are currently observing. Compared
     /// against the live one to notice a thread being loaded or dropped by
@@ -195,6 +213,7 @@ impl WorkerDashboard {
     /// for that worker rather than opening a second one.
     pub fn deploy(
         mission_id: MissionId,
+        mission_title: SharedString,
         metadata: ThreadMetadata,
         workspace: &mut Workspace,
         window: &mut Window,
@@ -215,31 +234,45 @@ impl WorkerDashboard {
         // cannot read the workspace back out of its own weak handle.
         let panel = workspace.panel::<AgentPanel>(cx);
         let weak_workspace = workspace.weak_handle();
-        let dashboard =
-            cx.new(|cx| WorkerDashboard::new(mission_id, metadata, weak_workspace, panel, cx));
+        let dashboard = cx.new(|cx| {
+            WorkerDashboard::new(
+                mission_id,
+                mission_title,
+                metadata,
+                weak_workspace,
+                panel,
+                window,
+                cx,
+            )
+        });
         workspace.add_item_to_active_pane(Box::new(dashboard.clone()), None, true, window, cx);
         dashboard
     }
 
     fn new(
         mission_id: MissionId,
+        mission_title: SharedString,
         metadata: ThreadMetadata,
         workspace: WeakEntity<Workspace>,
         agent_panel: Option<Entity<AgentPanel>>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let role = metadata
-            .role
-            .clone()
-            .map(SharedString::from)
-            .unwrap_or_else(|| metadata.display_title());
+        let role = worker_label(&metadata);
+        let instruction_editor = cx.new(|cx| {
+            let mut editor = Editor::auto_height(1, 6, window, cx);
+            editor.set_placeholder_text("Send an instruction to this worker…", window, cx);
+            editor
+        });
 
         let mut this = Self {
             mission_id,
+            mission_title,
             thread_id: metadata.thread_id,
             role,
             workspace,
             focus_handle: cx.focus_handle(),
+            instruction_editor,
             context_state: WorkerContextState::Loading,
             observed_thread: None,
             _thread_observation: None,
@@ -315,7 +348,8 @@ impl WorkerDashboard {
             .read(cx)
             .conversation_view_for_id(&self.thread_id, cx)
             .and_then(|view| view.read(cx).root_thread(cx));
-        if thread.as_ref().map(Entity::entity_id) == self.observed_thread.as_ref().map(Entity::entity_id)
+        if thread.as_ref().map(Entity::entity_id)
+            == self.observed_thread.as_ref().map(Entity::entity_id)
         {
             return;
         }
@@ -364,6 +398,104 @@ impl WorkerDashboard {
         let Some(metadata) = self.metadata(cx) else {
             return;
         };
+        self.open_thread_for(&metadata, window, cx);
+    }
+
+    fn stop(&mut self, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread(cx) else {
+            return;
+        };
+        thread.update(cx, |thread, cx| thread.cancel(cx)).detach();
+    }
+
+    fn authorize(
+        &mut self,
+        tool_call_id: acp::ToolCallId,
+        option: (acp::PermissionOptionId, acp::PermissionOptionKind),
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread) = self.thread(cx) else {
+            return;
+        };
+        authorize_worker(&thread, tool_call_id, option, cx);
+    }
+
+    /// The Mission's other workers, i.e. everyone this one could hand off to.
+    fn peer_workers(&self, cx: &App) -> Vec<ThreadMetadata> {
+        let Some(store) = ThreadMetadataStore::try_global(cx) else {
+            return Vec::new();
+        };
+        store
+            .read(cx)
+            .entries()
+            .filter(|metadata| {
+                metadata.mission_id == Some(self.mission_id) && metadata.thread_id != self.thread_id
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn send_instruction(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let instruction = self.instruction_editor.read(cx).text(cx).trim().to_string();
+        if instruction.is_empty() {
+            return;
+        }
+        let Some(thread) = self.thread(cx) else {
+            return;
+        };
+        send_to_worker(&thread, instruction, cx);
+        self.instruction_editor
+            .update(cx, |editor, cx| editor.clear(window, cx));
+        cx.notify();
+    }
+
+    /// Passes this worker's current task to `target`. The handoff is an
+    /// ordinary user message: the composer's text when the user typed one,
+    /// otherwise where this worker left off, so the receiving worker is told
+    /// what it is picking up rather than being prodded with a bare ping.
+    fn hand_off(&mut self, target: ThreadMetadata, window: &mut Window, cx: &mut Context<Self>) {
+        let note = self.instruction_editor.read(cx).text(cx).trim().to_string();
+        let summary = self
+            .thread(cx)
+            .and_then(|thread| last_assistant_summary(thread.read(cx), cx));
+        let message = if !note.is_empty() {
+            format!("Handing off from {}: {note}", self.role)
+        } else if let Some(summary) = summary {
+            format!(
+                "Handing off from {}. Where it left off: {summary}",
+                self.role
+            )
+        } else {
+            format!("Handing off from {}. Please pick this up.", self.role)
+        };
+
+        let target_thread = self.agent_panel(cx).and_then(|panel| {
+            panel
+                .read(cx)
+                .conversation_view_for_id(&target.thread_id, cx)?
+                .read(cx)
+                .root_thread(cx)
+        });
+
+        let Some(target_thread) = target_thread else {
+            // Nothing to send to yet. Put the receiving worker on screen so
+            // the user can start it, rather than silently dropping the handoff.
+            self.open_thread_for(&target, window, cx);
+            return;
+        };
+
+        send_to_worker(&target_thread, message, cx);
+        self.instruction_editor
+            .update(cx, |editor, cx| editor.clear(window, cx));
+        self.open_thread_for(&target, window, cx);
+    }
+
+    fn open_thread_for(
+        &self,
+        metadata: &ThreadMetadata,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
@@ -386,31 +518,12 @@ impl WorkerDashboard {
             workspace.focus_panel::<AgentPanel>(window, cx);
         });
     }
-
-    fn stop(&mut self, cx: &mut Context<Self>) {
-        let Some(thread) = self.thread(cx) else {
-            return;
-        };
-        thread.update(cx, |thread, cx| thread.cancel(cx)).detach();
-    }
-
-    fn authorize(
-        &mut self,
-        tool_call_id: acp::ToolCallId,
-        option: (acp::PermissionOptionId, acp::PermissionOptionKind),
-        cx: &mut Context<Self>,
-    ) {
-        let Some(thread) = self.thread(cx) else {
-            return;
-        };
-        authorize_worker(&thread, tool_call_id, option, cx);
-    }
 }
 
 /// The icon identifying a worker's harness, mirroring how `crates/sidebar`
 /// resolves thread icons: a built-in name, overridden by the agent server's
 /// own SVG when it ships one.
-pub(crate) fn harness_icon(
+pub fn harness_icon(
     agent_id: &AgentId,
     store: Option<&Entity<AgentServerStore>>,
     cx: &App,
@@ -435,7 +548,7 @@ pub(crate) fn harness_icon(
 
 /// Label and colour for a worker's state, shared by this dashboard's status
 /// pill and `MissionPanel`'s worker rows so the two never disagree.
-pub(crate) fn worker_status(state: MissionThreadState) -> (&'static str, Color) {
+pub fn worker_status(state: MissionThreadState) -> (&'static str, Color) {
     match state {
         MissionThreadState::Created => ("Not started", Color::Muted),
         MissionThreadState::Running => ("Working", Color::Success),
@@ -448,19 +561,19 @@ pub(crate) fn worker_status(state: MissionThreadState) -> (&'static str, Color) 
 impl WorkerDashboard {
     fn render_section(
         &self,
-        label: impl Into<SharedString>,
+        english: &'static str,
+        chinese: &'static str,
         children: impl IntoIterator<Item = AnyElement>,
     ) -> impl IntoElement {
         v_flex()
             .gap_1()
-            .child(
-                Label::new(label.into())
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-            )
+            .child(bilingual_label(english, chinese))
             .children(children)
     }
 
+    /// The design's session header: who this worker is, which harness runs it,
+    /// which Mission it belongs to, and the two things you can do to it
+    /// without opening its conversation.
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state(cx);
         let (status_label, status_color) = worker_status(state);
@@ -472,44 +585,221 @@ impl WorkerDashboard {
                 .unwrap_or_else(|| Agent::from(metadata.agent_id.clone()).label())
         });
         let is_generating = state == MissionThreadState::Running;
+        let peers = self.peer_workers(cx);
+        let mission_title = self.mission_title.clone();
 
-        h_flex()
+        v_flex()
             .w_full()
-            .gap_2()
+            .flex_none()
             .px_4()
             .py_3()
+            .gap_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)
             .child(
-                v_flex()
-                    .flex_1()
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
                     .child(Label::new(self.role.clone()))
-                    .children(agent_label.map(|label| {
-                        Label::new(format!("Harness: {label}"))
+                    .child(div().flex_1())
+                    .child(Indicator::dot().color(status_color))
+                    .child(
+                        Label::new(status_label)
                             .size(LabelSize::Small)
+                            .color(status_color),
+                    )
+                    .child(
+                        Button::new("worker-open-thread", "Open thread")
+                            .start_icon(Icon::new(IconName::Thread))
+                            .label_size(LabelSize::Small)
+                            .tooltip(Tooltip::text(
+                                "Show this worker's thread in the agent panel",
+                            ))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.open_thread(window, cx)),
+                            ),
+                    )
+                    .when(!peers.is_empty(), |this| {
+                        this.child(
+                            PopoverMenu::new("worker-hand-off")
+                                .trigger(
+                                    Button::new("worker-hand-off-trigger", "Hand off…")
+                                        .start_icon(Icon::new(IconName::ArrowRight))
+                                        .label_size(LabelSize::Small)
+                                        .tooltip(Tooltip::text(
+                                            "Pass this worker's current task to another worker",
+                                        )),
+                                )
+                                .menu({
+                                    let dashboard = cx.entity().downgrade();
+                                    move |window, cx| {
+                                        let peers = peers.clone();
+                                        let dashboard = dashboard.clone();
+                                        Some(ContextMenu::build(
+                                            window,
+                                            cx,
+                                            move |mut menu, _window, _cx| {
+                                                for peer in peers {
+                                                    let dashboard = dashboard.clone();
+                                                    let target = peer.clone();
+                                                    menu = menu.entry(
+                                                        worker_label(&peer),
+                                                        None,
+                                                        move |window, cx| {
+                                                            dashboard
+                                                                .update(cx, |this, cx| {
+                                                                    this.hand_off(
+                                                                        target.clone(),
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                })
+                                                                .ok();
+                                                        },
+                                                    );
+                                                }
+                                                menu
+                                            },
+                                        ))
+                                    }
+                                }),
+                        )
+                    })
+                    .when(is_generating, |this| {
+                        this.child(
+                            Button::new("worker-stop", "Stop")
+                                .start_icon(Icon::new(IconName::Stop))
+                                .label_size(LabelSize::Small)
+                                .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
+                        )
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .items_baseline()
+                    .children(
+                        agent_label.map(|label| {
+                            Label::new(label).size(LabelSize::Small).color(Color::Muted)
+                        }),
+                    )
+                    .child(
+                        Label::new("·")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Disabled),
+                    )
+                    .child(
+                        Label::new(format!("sub-session of {mission_title}"))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+    }
+
+    /// The one-line "where it stands" strip under the header, plus what the
+    /// turn has cost so far and what, if anything, it is blocked on.
+    fn render_summary(&self, snapshot: &WorkerSnapshot, cx: &mut Context<Self>) -> AnyElement {
+        let summary = self
+            .thread(cx)
+            .and_then(|thread| last_assistant_summary(thread.read(cx), cx));
+        let thread = self.thread(cx);
+        let tokens = thread
+            .as_ref()
+            .and_then(|thread| Some(thread.read(cx).token_usage()?.used_tokens));
+        let cost = thread
+            .as_ref()
+            .and_then(|thread| Some(thread.read(cx).cost()?.amount));
+        let blocked = snapshot
+            .permission
+            .as_ref()
+            .map(|permission| format!("blocked: {}", permission.label));
+
+        v_flex()
+            .w_full()
+            .flex_none()
+            .px_4()
+            .py_2()
+            .gap_0p5()
+            .bg(cx.theme().colors().element_background)
+            .children(summary.map(|summary| Label::new(summary).size(LabelSize::Small)))
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .items_baseline()
+                    .children(tokens.map(|tokens| {
+                        Label::new(format!("{} tokens", format_token_count(tokens)))
+                            .size(LabelSize::XSmall)
                             .color(Color::Muted)
-                    })),
+                    }))
+                    .children(cost.map(|cost| {
+                        Label::new(format!("${cost:.2}"))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                    }))
+                    .child(div().flex_1())
+                    .child(match blocked {
+                        Some(blocked) => Label::new(blocked)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Warning),
+                        None => Label::new("not blocked")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// Send-only composer. Prompting a worker still belongs to its agent-panel
+    /// thread; this exists so a one-line correction doesn't require leaving
+    /// the tab, and it deliberately shows no conversation of its own.
+    fn render_composer(&self, cx: &mut Context<Self>) -> AnyElement {
+        let can_send = self.thread(cx).is_some();
+
+        v_flex()
+            .w_full()
+            .flex_none()
+            .p_2()
+            .gap_1()
+            .border_t_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                div()
+                    .w_full()
+                    .px_2()
+                    .py_1p5()
+                    .rounded_md()
+                    .bg(cx.theme().colors().editor_background)
+                    .child(self.instruction_editor.clone()),
             )
             .child(
-                Label::new(status_label)
-                    .size(LabelSize::Small)
-                    .color(status_color),
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        Label::new(if can_send {
+                            "Goes to this worker as a user message"
+                        } else {
+                            "Open the thread first to send an instruction"
+                        })
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("worker-send-instruction", "Send")
+                            .start_icon(Icon::new(IconName::Send))
+                            .label_size(LabelSize::Small)
+                            .disabled(!can_send)
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.send_instruction(window, cx)
+                                }),
+                            ),
+                    ),
             )
-            .child(
-                Button::new("worker-open-thread", "Open thread")
-                    .start_icon(Icon::new(IconName::Thread))
-                    .label_size(LabelSize::Small)
-                    .tooltip(Tooltip::text("Show this worker's thread in the agent panel"))
-                    .on_click(cx.listener(|this, _, window, cx| this.open_thread(window, cx))),
-            )
-            .when(is_generating, |this| {
-                this.child(
-                    Button::new("worker-stop", "Stop")
-                        .start_icon(Icon::new(IconName::Stop))
-                        .label_size(LabelSize::Small)
-                        .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
-                )
-            })
+            .into_any_element()
     }
 
     fn render_permission_request(
@@ -519,23 +809,27 @@ impl WorkerDashboard {
     ) -> AnyElement {
         let render_button = |id: &'static str,
                              text: &'static str,
-                             option: Option<(acp::PermissionOptionId, acp::PermissionOptionKind)>,
+                             option: Option<(
+            acp::PermissionOptionId,
+            acp::PermissionOptionKind,
+        )>,
                              cx: &mut Context<Self>| {
             let tool_call_id = permission.tool_call_id.clone();
             option.map(|(option_id, option_kind)| {
                 Button::new(id, text)
                     .label_size(LabelSize::Small)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.authorize(
-                            tool_call_id.clone(),
-                            (option_id.clone(), option_kind),
-                            cx,
-                        );
+                        this.authorize(tool_call_id.clone(), (option_id.clone(), option_kind), cx);
                     }))
             })
         };
 
-        let allow = render_button("worker-permission-allow", "Allow", permission.allow.clone(), cx);
+        let allow = render_button(
+            "worker-permission-allow",
+            "Allow",
+            permission.allow.clone(),
+            cx,
+        );
         let reject = render_button(
             "worker-permission-reject",
             "Reject",
@@ -725,6 +1019,7 @@ impl Render for WorkerDashboard {
         let thread_loaded = snapshot.thread_loaded;
         let has_changes = !snapshot.changes.is_empty();
 
+        let summary = self.render_summary(&snapshot, cx);
         let current = snapshot
             .current_tool_call
             .map(|call| self.render_current_tool_call(call, cx));
@@ -738,9 +1033,13 @@ impl Render for WorkerDashboard {
             .bg(cx.theme().colors().editor_background)
             .track_focus(&self.focus_handle)
             .child(self.render_header(cx))
+            .when(thread_loaded, |this| this.child(summary))
             .child(
                 v_flex()
+                    .id("worker-dashboard-body")
                     .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .gap_4()
                     .p_4()
                     .when(!thread_loaded, |this| {
@@ -769,16 +1068,19 @@ impl Render for WorkerDashboard {
                     })
                     .children(permission)
                     .children(current.map(|current| {
-                        self.render_section("Current tool call", [current])
+                        self.render_section("CURRENT TOOL CALL", "当前工具调用", [current])
                             .into_any_element()
                     }))
                     .when(has_changes, |this| {
-                        this.child(self.render_section("Its changes", changes))
+                        this.child(self.render_section("ITS CHANGES", "本 Worker 的变更", changes))
                     })
-                    .child(
-                        self.render_section("Recorded to Shared Context", self.render_recorded()),
-                    ),
+                    .child(self.render_section(
+                        "RECORDED TO SHARED CONTEXT",
+                        "写入共享上下文",
+                        self.render_recorded(),
+                    )),
             )
+            .when(thread_loaded, |this| this.child(self.render_composer(cx)))
     }
 }
 

@@ -52,46 +52,24 @@ pub fn aggregate_mission_state(
     thread_states: impl IntoIterator<Item = MissionThreadState>,
 ) -> MissionState {
     let thread_states = thread_states.into_iter().collect::<Vec<_>>();
-    if thread_states.is_empty()
-        || thread_states
-            .iter()
-            .any(|state| *state == MissionThreadState::Created)
-    {
+    if thread_states.is_empty() || thread_states.contains(&MissionThreadState::Created) {
         return if thread_states.is_empty() {
             MissionState::Created
-        } else if thread_states
-            .iter()
-            .any(|state| *state == MissionThreadState::Failed)
-        {
+        } else if thread_states.contains(&MissionThreadState::Failed) {
             MissionState::Failed
-        } else if thread_states
-            .iter()
-            .any(|state| *state == MissionThreadState::Waiting)
-        {
+        } else if thread_states.contains(&MissionThreadState::Waiting) {
             MissionState::Waiting
-        } else if thread_states
-            .iter()
-            .any(|state| *state == MissionThreadState::Running)
-        {
+        } else if thread_states.contains(&MissionThreadState::Running) {
             MissionState::Running
         } else {
             MissionState::Created
         };
     }
-    if thread_states
-        .iter()
-        .any(|state| *state == MissionThreadState::Failed)
-    {
+    if thread_states.contains(&MissionThreadState::Failed) {
         MissionState::Failed
-    } else if thread_states
-        .iter()
-        .any(|state| *state == MissionThreadState::Waiting)
-    {
+    } else if thread_states.contains(&MissionThreadState::Waiting) {
         MissionState::Waiting
-    } else if thread_states
-        .iter()
-        .any(|state| *state == MissionThreadState::Running)
-    {
+    } else if thread_states.contains(&MissionThreadState::Running) {
         MissionState::Running
     } else {
         MissionState::Completed
@@ -118,7 +96,11 @@ pub fn mission_state(panel: &AgentPanel, mission_id: MissionId, cx: &App) -> Mis
 /// (aggregated across a Mission's threads) and directly by UI that shows a
 /// per-thread status alongside a Mission's aggregate, so callers don't need
 /// to re-derive `thread_state`'s logic themselves.
-pub fn thread_mission_state(panel: &AgentPanel, thread_id: ThreadId, cx: &App) -> MissionThreadState {
+pub fn thread_mission_state(
+    panel: &AgentPanel,
+    thread_id: ThreadId,
+    cx: &App,
+) -> MissionThreadState {
     let Some(view) = panel.conversation_view_for_id(&thread_id, cx) else {
         return MissionThreadState::Created;
     };
@@ -227,6 +209,10 @@ pub struct MissionOrchestratorModal {
     focus_handle: FocusHandle,
     panel: WeakEntity<AgentPanel>,
     fs: Arc<dyn Fs>,
+    /// Set when the modal is adding workers to a Mission that already exists,
+    /// which is the "New worker…" path out of the Mission sidebar. `None` is
+    /// the original flow: create the Mission and its first workers together.
+    existing_mission: Option<Mission>,
     title_editor: Entity<Editor>,
     agents: Vec<MissionAgentEntry>,
     selected_index: Option<usize>,
@@ -239,12 +225,17 @@ impl MissionOrchestratorModal {
         panel: WeakEntity<AgentPanel>,
         fs: Arc<dyn Fs>,
         agent_server_store: Entity<AgentServerStore>,
+        existing_mission: Option<Mission>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let title_editor = cx.new(|cx| {
             let mut editor = Editor::single_line(window, cx);
             editor.set_placeholder_text("Mission title", window, cx);
+            if let Some(mission) = &existing_mission {
+                editor.set_text(mission.title.clone(), window, cx);
+                editor.set_read_only(true);
+            }
             editor
         });
 
@@ -268,7 +259,7 @@ impl MissionOrchestratorModal {
                         agent_id.clone(),
                         store
                             .agent_display_name(agent_id)
-                            .unwrap_or_else(|| agent_id.0.clone().into()),
+                            .unwrap_or_else(|| agent_id.0.clone()),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -291,6 +282,7 @@ impl MissionOrchestratorModal {
             focus_handle: cx.focus_handle(),
             panel,
             fs,
+            existing_mission,
             title_editor,
             agents,
             selected_index: Some(0),
@@ -363,7 +355,8 @@ impl MissionOrchestratorModal {
 
         let title = self.title_editor.read(cx).text(cx).trim().to_string();
         let specs = selected_thread_specs(&self.agents, cx);
-        if title.is_empty() {
+        let existing_mission = self.existing_mission.clone();
+        if existing_mission.is_none() && title.is_empty() {
             self.error = Some("Enter a Mission title.".into());
             cx.notify();
             return;
@@ -378,9 +371,11 @@ impl MissionOrchestratorModal {
         self.creating = true;
         self.error = None;
 
-        let create_task = ThreadMetadataStore::global(cx)
-            .read(cx)
-            .create_mission(title, cx);
+        let create_task = existing_mission.is_none().then(|| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .create_mission(title, cx)
+        });
         let panel = self.panel.clone();
         cx.spawn_in(window, async move |this, cx| {
             let settings_result = settings_completion
@@ -396,15 +391,24 @@ impl MissionOrchestratorModal {
                 return anyhow::Ok(());
             }
 
-            let mission = match create_task.await {
-                Ok(mission) => mission,
-                Err(error) => {
-                    this.update(cx, |this, cx| {
-                        this.creating = false;
-                        this.error = Some(format!("Could not create Mission: {error:#}").into());
-                        cx.notify();
-                    })?;
-                    return anyhow::Ok(());
+            let mission = match existing_mission {
+                Some(mission) => mission,
+                None => {
+                    let Some(create_task) = create_task else {
+                        return anyhow::Ok(());
+                    };
+                    match create_task.await {
+                        Ok(mission) => mission,
+                        Err(error) => {
+                            this.update(cx, |this, cx| {
+                                this.creating = false;
+                                this.error =
+                                    Some(format!("Could not create Mission: {error:#}").into());
+                                cx.notify();
+                            })?;
+                            return anyhow::Ok(());
+                        }
+                    }
                 }
             };
 
@@ -482,6 +486,7 @@ impl ModalView for MissionOrchestratorModal {}
 
 impl Render for MissionOrchestratorModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let adding_worker = self.existing_mission.is_some();
         let agent_rows = self
             .agents
             .iter()
@@ -529,8 +534,16 @@ impl Render for MissionOrchestratorModal {
                 Modal::new("create-mission", None)
                     .header(
                         ModalHeader::new()
-                            .headline("Create Mission")
-                            .description("Choose the Harnesses and roles for this Mission.")
+                            .headline(if adding_worker {
+                                "Add Worker"
+                            } else {
+                                "Create Mission"
+                            })
+                            .description(if adding_worker {
+                                "Choose the Harnesses and roles to add to this Mission."
+                            } else {
+                                "Choose the Harnesses and roles for this Mission."
+                            })
                             .show_dismiss_button(true),
                     )
                     .section(
@@ -565,16 +578,25 @@ impl Render for MissionOrchestratorModal {
                     })
                     .footer(
                         ModalFooter::new().end_slot(
-                            Button::new("create-mission", "Create Mission")
-                                .loading(self.creating)
-                                .disabled(self.creating)
-                                .key_binding(
-                                    KeyBinding::for_action(&menu::SecondaryConfirm, cx)
-                                        .map(|binding| binding.size(rems_from_px(12.0_f32))),
-                                )
-                                .on_click(cx.listener(|this, _, window, cx| {
+                            Button::new(
+                                "create-mission",
+                                if adding_worker {
+                                    "Add Worker"
+                                } else {
+                                    "Create Mission"
+                                },
+                            )
+                            .loading(self.creating)
+                            .disabled(self.creating)
+                            .key_binding(
+                                KeyBinding::for_action(&menu::SecondaryConfirm, cx)
+                                    .map(|binding| binding.size(rems_from_px(12.0_f32))),
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
                                     this.create_mission(&menu::SecondaryConfirm, window, cx);
-                                })),
+                                },
+                            )),
                         ),
                     ),
             )
@@ -586,6 +608,30 @@ pub fn show_create_mission_modal(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
+    show_mission_modal(workspace, None, window, cx);
+}
+
+/// Opens the orchestrator so the user can add another Harness to a Mission
+/// that already exists. Reached from the Mission sidebar's "New worker…".
+pub fn add_worker_to_mission(
+    mission: Mission,
+    workspace: WeakEntity<Workspace>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    workspace
+        .update(cx, |workspace, cx| {
+            show_mission_modal(workspace, Some(mission), window, cx);
+        })
+        .ok();
+}
+
+fn show_mission_modal(
+    workspace: &mut Workspace,
+    existing_mission: Option<Mission>,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
         return;
     };
@@ -593,7 +639,14 @@ pub fn show_create_mission_modal(
     let agent_server_store = project.read(cx).agent_server_store().clone();
     let fs = project.read(cx).fs().clone();
     workspace.toggle_modal(window, cx, |window, cx| {
-        MissionOrchestratorModal::new(panel.downgrade(), fs, agent_server_store, window, cx)
+        MissionOrchestratorModal::new(
+            panel.downgrade(),
+            fs,
+            agent_server_store,
+            existing_mission,
+            window,
+            cx,
+        )
     });
 }
 
