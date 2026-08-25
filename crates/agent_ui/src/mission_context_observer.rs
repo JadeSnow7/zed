@@ -73,10 +73,25 @@ pub(crate) fn shared_context_store(cx: &App) -> Option<SharedContextStore> {
         .and_then(|global| global.0.clone())
 }
 
-fn mission_id_for_thread(thread_id: ThreadId, cx: &App) -> Option<shared_context::MissionId> {
+/// The Mission a thread belongs to, plus the `author` its observed rows should
+/// be attributed to. Rows are attributed to the thread's Mission role when it
+/// has one, so per-worker surfaces can tell whose work a row came from;
+/// [`OBSERVER_AUTHOR`] is the fallback for a thread with no role.
+fn mission_context_for_thread(
+    thread_id: ThreadId,
+    cx: &App,
+) -> Option<(shared_context::MissionId, String)> {
     let store = ThreadMetadataStore::try_global(cx)?;
-    let mission_id = store.read(cx).entry(thread_id)?.mission_id?;
-    shared_context::MissionId::from_key_string(&mission_id.to_key_string()).ok()
+    let metadata = store.read(cx).entry(thread_id)?;
+    let mission_id = metadata.mission_id?;
+    let author = metadata
+        .role
+        .as_ref()
+        .map(|role| role.trim())
+        .filter(|role| !role.is_empty())
+        .map_or_else(|| OBSERVER_AUTHOR.to_string(), |role| role.to_string());
+    let mission_id = shared_context::MissionId::from_key_string(&mission_id.to_key_string()).ok()?;
+    Some((mission_id, author))
 }
 
 fn strip_code_fence(source: &str) -> String {
@@ -109,7 +124,7 @@ pub fn observe_entry(
     index: usize,
     cx: &App,
 ) {
-    let Some(mission_id) = mission_id_for_thread(thread_id, cx) else {
+    let Some((mission_id, author)) = mission_context_for_thread(thread_id, cx) else {
         return;
     };
 
@@ -127,7 +142,7 @@ pub fn observe_entry(
             if !state.recorded_evidence_terminals.insert(terminal_id) {
                 continue;
             }
-            spawn_terminal_evidence_wait(mission_id, terminal.clone(), cx);
+            spawn_terminal_evidence_wait(mission_id, author.clone(), terminal.clone(), cx);
         }
         return;
     }
@@ -169,12 +184,7 @@ pub fn observe_entry(
     cx.background_spawn(async move {
         for path in paths {
             if let Err(err) = store
-                .record_artifact(
-                    mission_id,
-                    path,
-                    change_summary.clone(),
-                    OBSERVER_AUTHOR.to_string(),
-                )
+                .record_artifact(mission_id, path, change_summary.clone(), author.clone())
                 .await
             {
                 log::error!("mission_context_observer: failed to record artifact: {err:#}");
@@ -186,6 +196,7 @@ pub fn observe_entry(
 
 fn spawn_terminal_evidence_wait(
     mission_id: shared_context::MissionId,
+    author: String,
     terminal: Entity<acp_thread::Terminal>,
     cx: &App,
 ) {
@@ -208,13 +219,7 @@ fn spawn_terminal_evidence_wait(
         };
 
         if let Err(err) = store
-            .record_evidence(
-                mission_id,
-                command,
-                result,
-                exit_code,
-                OBSERVER_AUTHOR.to_string(),
-            )
+            .record_evidence(mission_id, command, result, exit_code, author)
             .await
         {
             log::error!("mission_context_observer: failed to record evidence: {err:#}");

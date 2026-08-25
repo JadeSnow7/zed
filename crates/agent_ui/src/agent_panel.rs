@@ -1166,6 +1166,11 @@ pub struct AgentPanel {
     last_created_entry_kind: AgentPanelEntryKind,
     draft_thread: Option<Entity<ConversationView>>,
     retained_threads: HashMap<ThreadId, Entity<ConversationView>>,
+    /// Threads that must stay in `retained_threads` regardless of how long
+    /// they've been idle, because a surface outside the panel is displaying
+    /// their live state (see `WorkerDashboard`). Reference-counted: two
+    /// dashboards on the same thread must both close before it can be evicted.
+    pinned_threads: HashMap<ThreadId, usize>,
     terminals: HashMap<TerminalId, AgentTerminal>,
     pending_terminal_spawn: Option<TerminalId>,
     new_thread_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -1568,6 +1573,7 @@ impl AgentPanel {
             context_server_registry,
             draft_thread: None,
             retained_threads: HashMap::default(),
+            pinned_threads: HashMap::default(),
             terminals: HashMap::default(),
             pending_terminal_spawn: None,
             new_thread_menu_handle: PopoverMenuHandle::default(),
@@ -4175,11 +4181,33 @@ impl AgentPanel {
         self.cleanup_retained_threads(cx);
     }
 
+    /// Keeps `thread_id` in `retained_threads` until a matching `unpin_thread`,
+    /// so a surface outside the panel can keep reading the thread's live state.
+    pub fn pin_thread(&mut self, thread_id: ThreadId) {
+        *self.pinned_threads.entry(thread_id).or_insert(0) += 1;
+    }
+
+    /// Releases one `pin_thread` hold. The thread becomes evictable again once
+    /// the last hold is released.
+    pub fn unpin_thread(&mut self, thread_id: ThreadId, cx: &App) {
+        let Some(count) = self.pinned_threads.get_mut(&thread_id) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            self.pinned_threads.remove(&thread_id);
+            self.cleanup_retained_threads(cx);
+        }
+    }
+
     fn cleanup_retained_threads(&mut self, cx: &App) {
         let mut potential_removals = self
             .retained_threads
             .iter()
-            .filter(|(_id, view)| {
+            .filter(|(id, view)| {
+                if self.pinned_threads.contains_key(*id) {
+                    return false;
+                }
                 let Some(thread_view) = view.read(cx).root_thread_view() else {
                     return true;
                 };

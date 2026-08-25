@@ -21,7 +21,9 @@ use agent_ui::{
     NewThread, RenameSelectedThread, TerminalId, ThreadId, ThreadImportModal,
     ThreadTitleRegenerationResult, channels_with_threads, import_threads_from_other_channels,
 };
-use agent_ui::{MessageEditorEvent, StateChange, thread_worktree_archive};
+use agent_ui::{
+    MessageEditorEvent, MissionPanel, MissionPanelEvent, StateChange, thread_worktree_archive,
+};
 use chrono::{DateTime, Utc};
 use editor::Editor;
 use feature_flags::{
@@ -90,6 +92,8 @@ gpui::actions!(
         NewThreadInGroup,
         /// Toggles between the thread list and the thread history.
         ToggleThreadHistory,
+        /// Toggles between the thread list and the Mission view.
+        ToggleMissions,
     ]
 );
 
@@ -111,6 +115,7 @@ enum SerializedSidebarView {
     ThreadList,
     #[serde(alias = "Archive")]
     History,
+    Mission,
 }
 
 #[derive(Clone, Copy)]
@@ -132,6 +137,11 @@ enum SidebarView {
     #[default]
     ThreadList,
     Archive(Entity<ThreadsArchiveView>),
+    /// The Mission view: the sidebar shows one Mission's workers, changes and
+    /// shared-context trail instead of a flat thread list. Hosted here rather
+    /// than in a dock so it occupies the slot the design puts it in; the
+    /// thread list is still one toggle away.
+    Mission(Entity<MissionPanel>),
 }
 
 enum ArchiveWorktreeOutcome {
@@ -771,6 +781,10 @@ pub struct Sidebar {
     /// its interaction time.
     draft_kinds: HashMap<ThreadId, DraftKind>,
     view: SidebarView,
+    /// Set once `restore_serialized_state` has spoken for which view to show,
+    /// so the "default to Missions when this workspace has any" fallback in
+    /// `new` never overrides a view the user last chose themselves.
+    view_restored: bool,
     restoring_tasks: HashMap<agent_ui::ThreadId, Task<()>>,
     recent_projects_popover_handle: PopoverMenuHandle<SidebarRecentProjects>,
     project_header_menu_handles: HashMap<usize, PopoverMenuHandle<ContextMenu>>,
@@ -886,6 +900,10 @@ impl Sidebar {
             this.schedule_update_entries(false, cx);
         });
 
+        cx.defer_in(window, |this, window, cx| {
+            this.default_to_missions_if_unrestored(window, cx);
+        });
+
         Self {
             multi_workspace: multi_workspace.downgrade(),
             width: DEFAULT_WIDTH,
@@ -909,6 +927,7 @@ impl Sidebar {
             live_thread_statuses: HashMap::new(),
             draft_kinds: HashMap::new(),
             view: SidebarView::default(),
+            view_restored: false,
             restoring_tasks: HashMap::new(),
             recent_projects_popover_handle: PopoverMenuHandle::default(),
             project_header_menu_handles: HashMap::new(),
@@ -7342,6 +7361,7 @@ impl Sidebar {
 
     fn render_sidebar_bottom_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_archive = matches!(self.view, SidebarView::Archive(..));
+        let is_mission = matches!(self.view, SidebarView::Mission(..));
         let on_right = self.side(cx) == SidebarSide::Right;
 
         h_flex()
@@ -7365,6 +7385,22 @@ impl Sidebar {
                     })
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_archive(&ToggleThreadHistory, window, cx);
+                    })),
+            )
+            .child(
+                IconButton::new("missions", IconName::ListTodo)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(is_mission)
+                    .tooltip(move |_, cx| {
+                        let label = if is_mission {
+                            "Show Threads"
+                        } else {
+                            "Show Missions"
+                        };
+                        Tooltip::for_action(label, &ToggleMissions, cx)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_missions(&ToggleMissions, window, cx);
                     })),
             )
             .child(div().flex_1())
@@ -7523,11 +7559,42 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         match &self.view {
-            SidebarView::ThreadList => {
+            SidebarView::Archive(_) => self.show_thread_list(window, cx),
+            SidebarView::ThreadList | SidebarView::Mission(_) => {
                 self.show_archive(window, cx);
             }
-            SidebarView::Archive(_) => self.show_thread_list(window, cx),
         }
+    }
+
+    fn toggle_missions(&mut self, _: &ToggleMissions, window: &mut Window, cx: &mut Context<Self>) {
+        match &self.view {
+            SidebarView::Mission(_) => self.show_thread_list(window, cx),
+            SidebarView::ThreadList | SidebarView::Archive(_) => self.show_missions(window, cx),
+        }
+    }
+
+    /// Puts the Mission view in the sidebar slot, bound to the currently
+    /// active workspace. Rebuilt on each switch rather than kept alive, so it
+    /// always follows the workspace the user is actually looking at.
+    fn show_missions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active_workspace) = self.active_workspace(cx) else {
+            return;
+        };
+
+        let panel =
+            cx.new(|cx| MissionPanel::for_workspace(active_workspace.downgrade(), window, cx));
+        let subscription = cx.subscribe_in(
+            &panel,
+            window,
+            |this, _, event: &MissionPanelEvent, window, cx| match event {
+                MissionPanelEvent::ShowThreadList => this.show_thread_list(window, cx),
+            },
+        );
+
+        self._subscriptions.push(subscription);
+        self.view = SidebarView::Mission(panel);
+        self.serialize(cx);
+        cx.notify();
     }
 
     fn show_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7597,6 +7664,33 @@ impl Sidebar {
         archive_view.update(cx, |view, cx| view.focus_filter_editor(window, cx));
         self.serialize(cx);
         cx.notify();
+    }
+
+    /// Shows Missions instead of the thread list on first run in a workspace
+    /// that already has one, so the sidebar opens on the surface the Mission
+    /// design puts there. A restored view always wins: the user's last choice
+    /// is a stronger signal than "this workspace has Missions".
+    fn default_to_missions_if_unrestored(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(store) = ThreadMetadataStore::try_global(cx) else {
+            return;
+        };
+        let missions = store.read(cx).list_missions(cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let has_missions = missions
+                .await
+                .map(|missions| !missions.is_empty())
+                .unwrap_or(false);
+            if !has_missions {
+                return;
+            }
+            this.update_in(cx, |this, window, cx| {
+                if !this.view_restored && matches!(this.view, SidebarView::ThreadList) {
+                    this.show_missions(window, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn show_thread_list(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7724,6 +7818,7 @@ impl WorkspaceSidebar for Sidebar {
             active_view: match self.view {
                 SidebarView::ThreadList => SerializedSidebarView::ThreadList,
                 SidebarView::Archive(_) => SerializedSidebarView::History,
+                SidebarView::Mission(_) => SerializedSidebarView::Mission,
             },
         };
         serde_json::to_string(&serialized).ok()
@@ -7736,13 +7831,22 @@ impl WorkspaceSidebar for Sidebar {
         cx: &mut Context<Self>,
     ) {
         if let Some(serialized) = serde_json::from_str::<SerializedSidebar>(state).log_err() {
+            self.view_restored = true;
             if let Some(width) = serialized.width {
                 self.width = px(width).clamp(MIN_WIDTH, MAX_WIDTH);
             }
-            if serialized.active_view == SerializedSidebarView::History {
-                cx.defer_in(window, |this, window, cx| {
-                    this.show_archive(window, cx);
-                });
+            match serialized.active_view {
+                SerializedSidebarView::History => {
+                    cx.defer_in(window, |this, window, cx| {
+                        this.show_archive(window, cx);
+                    });
+                }
+                SerializedSidebarView::Mission => {
+                    cx.defer_in(window, |this, window, cx| {
+                        this.show_missions(window, cx);
+                    });
+                }
+                SerializedSidebarView::ThreadList => {}
             }
         }
         cx.notify();
@@ -7793,6 +7897,7 @@ impl Render for Sidebar {
             .on_action(cx.listener(Self::new_thread_in_group))
             .on_action(cx.listener(Self::new_terminal_thread))
             .on_action(cx.listener(Self::toggle_archive))
+            .on_action(cx.listener(Self::toggle_missions))
             .on_action(cx.listener(Self::focus_sidebar_filter))
             .on_action(cx.listener(Self::on_toggle_thread_switcher))
             .on_action(cx.listener(Self::on_next_project))
@@ -7883,6 +7988,7 @@ impl Render for Sidebar {
                         }
                     }),
                 SidebarView::Archive(archive_view) => this.child(archive_view.clone()),
+                SidebarView::Mission(mission_panel) => this.child(mission_panel.clone()),
             })
             .map(|this| {
                 let show_acp = self.should_render_acp_import_onboarding(cx);
