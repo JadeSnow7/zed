@@ -2681,4 +2681,105 @@ mod tests {
             "clicking the thread row should switch AgentPanel to the existing thread via load_agent_thread"
         );
     }
+
+    #[gpui::test]
+    async fn selecting_a_mission_before_the_previous_ones_context_query_resolves_keeps_the_new_one(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, _agent_panel, _thread_a, _thread_b, mut cx) =
+            setup_workspace_with_two_threads(cx).await;
+
+        // A real, test-isolated Shared Context store, so `refresh_context`
+        // actually takes its async `background_spawn` path instead of the
+        // synchronous `Unavailable` early-return it takes with no store.
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path = tempdir.path().join("shared_context.sqlite");
+        // `SharedContextStore::open`'s builder future is not `Send` (see
+        // `mission_context_observer::init`'s doc comment), so it must be
+        // blocked on directly rather than awaited inside the test's executor.
+        let store = gpui::block_on(shared_context::SharedContextStore::open(&db_path)).unwrap();
+        cx.update(|_window, cx| {
+            crate::mission_context_observer::set_global_for_test(Some(store.clone()), cx)
+        });
+
+        let mission_a = cx
+            .update(|_window, cx| {
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .create_mission("Mission A".to_string(), cx)
+            })
+            .await
+            .unwrap();
+        let mission_b = cx
+            .update(|_window, cx| {
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .create_mission("Mission B".to_string(), cx)
+            })
+            .await
+            .unwrap();
+
+        let shared_mission_a =
+            shared_context::MissionId::from_key_string(&mission_a.id.to_key_string()).unwrap();
+        let shared_mission_b =
+            shared_context::MissionId::from_key_string(&mission_b.id.to_key_string()).unwrap();
+        // Like `open`, `record_decision`'s work happens on a real background
+        // thread (see `ThreadSafeConnection`), so it must be blocked on
+        // directly rather than awaited inside the test's deterministic
+        // executor.
+        gpui::block_on(store.record_decision(
+            shared_mission_a,
+            "key".to_string(),
+            "mission A's decision".to_string(),
+            "tester".to_string(),
+        ))
+        .unwrap();
+        gpui::block_on(store.record_decision(
+            shared_mission_b,
+            "key".to_string(),
+            "mission B's decision".to_string(),
+            "tester".to_string(),
+        ))
+        .unwrap();
+
+        let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+            cx.new(|cx| MissionPanel::new(workspace, window, cx))
+        });
+        cx.run_until_parked();
+
+        // Select Mission A, then -- before its query has had any chance to
+        // run -- select Mission B. `select_mission` stores its query's `Task`
+        // in `_context_refresh_task`, so replacing it here drops (and
+        // cancels) Mission A's still-unpolled query outright; without that,
+        // both queries would run and whichever settled last would decide
+        // `context_state`, regardless of which Mission the user actually
+        // ended up looking at.
+        panel.update(&mut cx, |panel, cx| {
+            panel.select_mission(mission_a.id, cx);
+            panel.select_mission(mission_b.id, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert_eq!(panel.selected_mission, Some(mission_b.id));
+            match &panel.context_state {
+                MissionContextState::Populated(context) => {
+                    assert_eq!(context.decisions.len(), 1);
+                    assert_eq!(context.decisions[0].value, "mission B's decision");
+                }
+                MissionContextState::Loading => {
+                    panic!("expected Mission B's context to be populated, got Loading")
+                }
+                MissionContextState::NoSelection => {
+                    panic!("expected Mission B's context to be populated, got NoSelection")
+                }
+                MissionContextState::Empty => {
+                    panic!("expected Mission B's context to be populated, got Empty")
+                }
+                MissionContextState::Unavailable => {
+                    panic!("expected Mission B's context to be populated, got Unavailable")
+                }
+            }
+        });
+    }
 }

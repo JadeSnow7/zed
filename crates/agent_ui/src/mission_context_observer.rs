@@ -73,6 +73,14 @@ pub(crate) fn shared_context_store(cx: &App) -> Option<SharedContextStore> {
         .and_then(|global| global.0.clone())
 }
 
+/// Points `shared_context_store` at a store opened by the test itself (e.g. at
+/// a temp-dir path), rather than the real, unversioned `paths::database_dir()`
+/// location `init` uses -- tests need isolation `init` doesn't provide.
+#[cfg(test)]
+pub(crate) fn set_global_for_test(store: Option<SharedContextStore>, cx: &mut App) {
+    cx.set_global(GlobalSharedContext(store));
+}
+
 /// The Mission a thread belongs to, plus the `author` its observed rows should
 /// be attributed to. Rows are attributed to the thread's Mission role when it
 /// has one, so per-worker surfaces can tell whose work a row came from;

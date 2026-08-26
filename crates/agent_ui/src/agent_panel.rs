@@ -4200,7 +4200,7 @@ impl AgentPanel {
         }
     }
 
-    fn cleanup_retained_threads(&mut self, cx: &App) {
+    pub(crate) fn cleanup_retained_threads(&mut self, cx: &App) {
         let mut potential_removals = self
             .retained_threads
             .iter()

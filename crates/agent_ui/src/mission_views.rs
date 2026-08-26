@@ -1468,12 +1468,351 @@ impl workspace::StatusItemView for MissionStatusIndicator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MaxIdleRetainedThreads;
+    use crate::test_support;
+    use acp_thread::{PermissionOptions, StubAgentConnection};
+    use agent_client_protocol::schema::v1 as acp;
+    use gpui::{TestAppContext, VisualTestContext};
+    use project::{FakeFs, Project};
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::path::Path;
+    use workspace::MultiWorkspace;
 
     #[test]
     fn short_mission_id_is_the_first_eight_characters() {
-        let mission_id = MissionId::new();
-        let short = short_mission_id(mission_id);
-        assert_eq!(short.len(), 8);
-        assert!(mission_id.to_key_string().starts_with(&short));
+        let id = MissionId::new();
+        let full = id.to_key_string();
+        assert_eq!(
+            short_mission_id(id),
+            full.chars().take(8).collect::<String>()
+        );
+        assert_eq!(short_mission_id(id).len(), 8);
+    }
+
+    async fn setup_workspace_with_two_threads(
+        cx: &mut TestAppContext,
+        connection_a: StubAgentConnection,
+        connection_b: StubAgentConnection,
+    ) -> (
+        Entity<Workspace>,
+        Entity<AgentPanel>,
+        ThreadMetadata,
+        ThreadMetadata,
+        VisualTestContext,
+    ) {
+        test_support::init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            ThreadMetadataStore::init_global(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        cx.update(|cx| <dyn fs::Fs>::set_global(fs.clone(), cx));
+        fs.insert_tree("/project", json!({ "file.txt": "" })).await;
+        let project = Project::test(fs.clone(), [Path::new("/project")], cx).await;
+
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |mw, _cx| mw.workspace().clone())
+            .unwrap();
+        let mut cx = VisualTestContext::from_window(multi_workspace.into(), cx);
+        test_support::register_test_sidebar(true, &mut cx);
+
+        let agent_panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        // Distinct connections need `open_thread_with_custom_connection`: the
+        // plain `open_thread_with_connection` wraps every server with the
+        // same hardcoded agent id, so a second distinct connection would
+        // otherwise be routed through the first one's server instead of its
+        // own.
+        test_support::open_thread_with_custom_connection(&agent_panel, connection_a, &mut cx);
+        let thread_a = agent_panel.read_with(&cx, |panel, cx| {
+            let thread_id = panel.active_thread_id(cx).unwrap();
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(thread_id)
+                .unwrap()
+                .clone()
+        });
+
+        test_support::open_thread_with_custom_connection(&agent_panel, connection_b, &mut cx);
+        let thread_b = agent_panel.read_with(&cx, |panel, cx| {
+            let thread_id = panel.active_thread_id(cx).unwrap();
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .entry(thread_id)
+                .unwrap()
+                .clone()
+        });
+
+        (workspace, agent_panel, thread_a, thread_b, cx)
+    }
+
+    /// Puts both threads under one Mission with distinct roles, mirroring
+    /// `mission_panel`'s own `setup_mission_panel` test harness.
+    async fn setup_mission_with_two_workers(
+        cx: &mut TestAppContext,
+        connection_a: StubAgentConnection,
+        connection_b: StubAgentConnection,
+    ) -> (
+        Entity<Workspace>,
+        Entity<AgentPanel>,
+        Mission,
+        ThreadMetadata,
+        ThreadMetadata,
+        VisualTestContext,
+    ) {
+        let (workspace, agent_panel, thread_a, thread_b, mut cx) =
+            setup_workspace_with_two_threads(cx, connection_a, connection_b).await;
+
+        let create = cx.update(|_window, cx| {
+            ThreadMetadataStore::global(cx)
+                .read(cx)
+                .create_mission("Test Mission".to_string(), cx)
+        });
+        let mission = create.await.unwrap();
+
+        cx.update(|_window, cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.set_thread_mission(
+                    thread_a.thread_id,
+                    Some(mission.id),
+                    Some("Implementation".to_string()),
+                    cx,
+                );
+                store.set_thread_mission(
+                    thread_b.thread_id,
+                    Some(mission.id),
+                    Some("Review".to_string()),
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        (workspace, agent_panel, mission, thread_a, thread_b, cx)
+    }
+
+    #[gpui::test]
+    async fn mission_queue_view_pins_worker_threads_while_open(cx: &mut TestAppContext) {
+        let loadable_connection = |agent_id: &'static str| {
+            StubAgentConnection::new()
+                .with_supports_load_session(true)
+                .with_agent_id(agent_id.into())
+                .with_telemetry_id(agent_id.into())
+        };
+        let (workspace, agent_panel, mission, thread_a, _thread_b, mut cx) =
+            setup_mission_with_two_workers(
+                cx,
+                loadable_connection("loadable-stub-a"),
+                loadable_connection("loadable-stub-b"),
+            )
+            .await;
+
+        // Thread B was opened after thread A, so A is no longer the active
+        // `BaseView` and already sits in `retained_threads` under the default
+        // idle-retention cap of five.
+        agent_panel.read_with(&cx, |panel, cx| {
+            assert!(
+                panel
+                    .conversation_view_for_id(&thread_a.thread_id, cx)
+                    .is_some(),
+                "thread A should already be retained before the queue view opens"
+            );
+        });
+
+        let panel_entity =
+            workspace.read_with(&cx, |workspace, cx| workspace.panel::<AgentPanel>(cx));
+        let queue_view = workspace.update_in(&mut cx, |workspace, window, cx| {
+            cx.new(|cx| {
+                MissionQueueView::new(
+                    mission.clone(),
+                    workspace.weak_handle(),
+                    panel_entity.clone(),
+                    window,
+                    cx,
+                )
+            })
+        });
+        cx.run_until_parked();
+
+        // Shrink the idle-retention cap to zero and force a cleanup pass:
+        // without the queue view's pin, this would evict thread A outright.
+        cx.update(|_window, cx| cx.set_global(MaxIdleRetainedThreads(0)));
+        agent_panel.update(&mut cx, |panel, cx| panel.cleanup_retained_threads(cx));
+
+        agent_panel.read_with(&cx, |panel, cx| {
+            assert!(
+                panel
+                    .conversation_view_for_id(&thread_a.thread_id, cx)
+                    .is_some(),
+                "a worker thread pinned by an open queue view must survive cleanup even past the idle-retention cap"
+            );
+        });
+
+        drop(queue_view);
+        cx.run_until_parked();
+        agent_panel.update(&mut cx, |panel, cx| panel.cleanup_retained_threads(cx));
+
+        agent_panel.read_with(&cx, |panel, cx| {
+            assert!(
+                panel
+                    .conversation_view_for_id(&thread_a.thread_id, cx)
+                    .is_none(),
+                "closing the queue view should release its pins so idle threads become evictable again"
+            );
+        });
+    }
+
+    /// The queue view is also constructed without a panel handle, but
+    /// `sync_worker_subscriptions` finds the `AgentPanel` through the workspace
+    /// either way and pins against it -- so the release hook has to be
+    /// registered unconditionally, or those pins outlive the view.
+    #[gpui::test]
+    async fn a_queue_view_built_without_a_panel_handle_still_releases_its_pins(
+        cx: &mut TestAppContext,
+    ) {
+        let loadable_connection = |agent_id: &'static str| {
+            StubAgentConnection::new()
+                .with_supports_load_session(true)
+                .with_agent_id(agent_id.into())
+                .with_telemetry_id(agent_id.into())
+        };
+        let (workspace, agent_panel, mission, thread_a, _thread_b, mut cx) =
+            setup_mission_with_two_workers(
+                cx,
+                loadable_connection("loadable-stub-a"),
+                loadable_connection("loadable-stub-b"),
+            )
+            .await;
+
+        let queue_view = workspace.update_in(&mut cx, |workspace, window, cx| {
+            cx.new(|cx| {
+                MissionQueueView::new(mission.clone(), workspace.weak_handle(), None, window, cx)
+            })
+        });
+        cx.run_until_parked();
+
+        cx.update(|_window, cx| cx.set_global(MaxIdleRetainedThreads(0)));
+        agent_panel.update(&mut cx, |panel, cx| panel.cleanup_retained_threads(cx));
+        agent_panel.read_with(&cx, |panel, cx| {
+            assert!(
+                panel
+                    .conversation_view_for_id(&thread_a.thread_id, cx)
+                    .is_some(),
+                "the queue view should pin through the workspace even without a panel handle"
+            );
+        });
+
+        drop(queue_view);
+        cx.run_until_parked();
+        agent_panel.update(&mut cx, |panel, cx| panel.cleanup_retained_threads(cx));
+        agent_panel.read_with(&cx, |panel, cx| {
+            assert!(
+                panel
+                    .conversation_view_for_id(&thread_a.thread_id, cx)
+                    .is_none(),
+                "dropping the view must release its pins even when it was built without a panel handle"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn mission_status_indicator_reflects_worker_state_without_waiting_for_the_poll(
+        cx: &mut TestAppContext,
+    ) {
+        let tool_call_id = acp::ToolCallId::new("mission-status-indicator-tool-call");
+        let allow_option =
+            acp::PermissionOption::new("allow", "Allow", acp::PermissionOptionKind::AllowOnce);
+        let connection = StubAgentConnection::new()
+            .with_agent_id("worker-b-stub".into())
+            .with_telemetry_id("worker-b-stub".into())
+            .with_permission_requests(HashMap::from_iter([(
+                tool_call_id.clone(),
+                PermissionOptions::Flat(vec![allow_option.clone()]),
+            )]));
+        let connection_a = StubAgentConnection::new()
+            .with_agent_id("worker-a-stub".into())
+            .with_telemetry_id("worker-a-stub".into());
+
+        let (workspace, agent_panel, mission, _thread_a, _thread_b, mut cx) =
+            setup_mission_with_two_workers(cx, connection_a, connection.clone()).await;
+
+        let indicator = workspace.update_in(&mut cx, |workspace, _window, cx| {
+            cx.new(|cx| MissionStatusIndicator::new(workspace.weak_handle(), cx))
+        });
+        cx.run_until_parked();
+
+        let counts = |cx: &mut VisualTestContext| {
+            cx.update(|_window, cx| mission_snapshot(&mission, &workspace.downgrade(), cx).counts())
+        };
+
+        // Thread B (the active thread) is sent a message with no scripted
+        // response, so its turn stays open and the thread reports Generating.
+        test_support::send_message(&agent_panel, &mut cx);
+        let running = counts(&mut cx);
+        assert_eq!(
+            running.running, 1,
+            "a generating worker should count as running"
+        );
+        assert_eq!(running.blocked, 0);
+
+        connection.end_turn(
+            test_support::active_session_id(&agent_panel, &cx),
+            acp::StopReason::EndTurn,
+        );
+        cx.run_until_parked();
+
+        // Start a second turn that raises a permission request, putting the
+        // worker into Waiting -- and the indicator should reflect that the
+        // moment it's drawn, without waiting on the 5-second poll.
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::ToolCall(
+            acp::ToolCall::new(tool_call_id.clone(), "Edit a file").kind(acp::ToolKind::Edit),
+        )]);
+        test_support::send_message(&agent_panel, &mut cx);
+
+        let waiting = counts(&mut cx);
+        assert_eq!(
+            waiting.blocked, 1,
+            "a pending permission should count as blocked"
+        );
+        assert_eq!(waiting.running, 0);
+
+        // Draw the indicator while blocked so the render path itself is
+        // exercised, not just the counts it's built from.
+        cx.draw(
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            gpui::size(gpui::px(400.), gpui::px(80.)),
+            |_, _| indicator.clone().into_any_element(),
+        );
+        cx.run_until_parked();
+
+        let thread_entity = agent_panel
+            .read_with(&cx, |panel, cx| panel.active_agent_thread(cx))
+            .expect("thread B should be the active agent thread");
+        cx.update(|_window, cx| {
+            authorize_worker(
+                &thread_entity,
+                tool_call_id.clone(),
+                (allow_option.option_id.clone(), allow_option.kind),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let completed = counts(&mut cx);
+        assert_eq!(
+            completed.blocked, 0,
+            "authorizing the tool call should clear the block without waiting on the poll"
+        );
+        assert_eq!(completed.running, 0);
+        assert_eq!(completed.agents, 2);
     }
 }
