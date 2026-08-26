@@ -32,9 +32,11 @@ use workspace::{
 
 use crate::{
     Agent, AgentPanel, AgentThreadSource, MissionThreadState,
+    conversation_view::ThreadView,
     mission_context_observer::shared_context_store,
     mission_panel::{
-        bilingual_label, format_token_count, last_assistant_summary, send_to_worker, worker_label,
+        bilingual_label, format_token_count, last_assistant_summary, send_to_worker,
+        show_send_failed_toast, worker_label,
     },
     thread_metadata_store::{MissionId, ThreadId, ThreadMetadata, ThreadMetadataStore},
     thread_mission_state,
@@ -187,7 +189,7 @@ enum WorkerContextState {
     Unavailable,
 }
 
-pub struct WorkerDashboard {
+pub(crate) struct WorkerDashboard {
     mission_id: MissionId,
     mission_title: SharedString,
     thread_id: ThreadId,
@@ -312,6 +314,17 @@ impl WorkerDashboard {
             .conversation_view_for_id(&self.thread_id, cx)?
             .read(cx)
             .root_thread(cx)
+    }
+
+    /// The worker's `ThreadView`, used to send it a message; see
+    /// `mission_panel::send_to_worker`.
+    fn thread_view(&self, cx: &App) -> Option<Entity<ThreadView>> {
+        let panel = self.agent_panel(cx)?;
+        let panel = panel.read(cx);
+        panel
+            .conversation_view_for_id(&self.thread_id, cx)?
+            .read(cx)
+            .root_thread_view()
     }
 
     fn agent_server_store(&self, cx: &App) -> Option<Entity<AgentServerStore>> {
@@ -440,13 +453,25 @@ impl WorkerDashboard {
         if instruction.is_empty() {
             return;
         }
-        let Some(thread) = self.thread(cx) else {
+        let Some(thread_view) = self.thread_view(cx) else {
             return;
         };
-        send_to_worker(&thread, instruction, cx);
-        self.instruction_editor
-            .update(cx, |editor, cx| editor.clear(window, cx));
-        cx.notify();
+        let send = send_to_worker(&thread_view, instruction, window, cx);
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = send.await;
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(()) => {
+                        this.instruction_editor
+                            .update(cx, |editor, cx| editor.clear(window, cx));
+                    }
+                    Err(error) => show_send_failed_toast(&workspace, error, cx),
+                }
+                cx.notify();
+            })
+        })
+        .detach();
     }
 
     /// Passes this worker's current task to `target`. The handoff is an
@@ -469,24 +494,34 @@ impl WorkerDashboard {
             format!("Handing off from {}. Please pick this up.", self.role)
         };
 
-        let target_thread = self.agent_panel(cx).and_then(|panel| {
+        let target_thread_view = self.agent_panel(cx).and_then(|panel| {
             panel
                 .read(cx)
                 .conversation_view_for_id(&target.thread_id, cx)?
                 .read(cx)
-                .root_thread(cx)
+                .root_thread_view()
         });
 
-        let Some(target_thread) = target_thread else {
+        let Some(target_thread_view) = target_thread_view else {
             // Nothing to send to yet. Put the receiving worker on screen so
             // the user can start it, rather than silently dropping the handoff.
             self.open_thread_for(&target, window, cx);
             return;
         };
 
-        send_to_worker(&target_thread, message, cx);
-        self.instruction_editor
-            .update(cx, |editor, cx| editor.clear(window, cx));
+        let send = send_to_worker(&target_thread_view, message, window, cx);
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = send.await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(()) => {
+                    this.instruction_editor
+                        .update(cx, |editor, cx| editor.clear(window, cx));
+                }
+                Err(error) => show_send_failed_toast(&workspace, error, cx),
+            })
+        })
+        .detach();
         self.open_thread_for(&target, window, cx);
     }
 

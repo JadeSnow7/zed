@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use acp_thread::{AcpThread, AgentThreadEntry, ThreadStatus, ToolCallStatus};
 use agent_client_protocol::schema::v1 as acp;
+use collections::HashSet;
 use editor::Editor;
 use fs::Fs;
 use gpui::{
@@ -110,16 +111,27 @@ pub fn thread_mission_state(
     thread_state(thread.read(cx))
 }
 
+/// A thread's history accumulates every turn it has ever run, but a failed
+/// or rejected tool call from a turn that has since completed successfully
+/// says nothing about the worker's current state. Scoping the failure scan
+/// to entries at or after the last `UserMessage` keeps `Failed` tied to the
+/// turn actually in progress (or most recently finished), matching
+/// `AcpThread::had_error`, which `run_turn` resets at the start of each turn.
 fn thread_state(thread: &AcpThread) -> MissionThreadState {
-    if thread.had_error()
-        || thread.entries().iter().any(|entry| {
-            matches!(
-                entry,
-                AgentThreadEntry::ToolCall(call)
-                    if matches!(call.status, ToolCallStatus::Failed | ToolCallStatus::Rejected)
-            )
-        })
-    {
+    let entries = thread.entries();
+    let current_turn_start = entries
+        .iter()
+        .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+        .unwrap_or(0);
+    let current_turn_failed = entries[current_turn_start..].iter().any(|entry| {
+        matches!(
+            entry,
+            AgentThreadEntry::ToolCall(call)
+                if matches!(call.status, ToolCallStatus::Failed | ToolCallStatus::Rejected)
+        )
+    });
+
+    if thread.had_error() || current_turn_failed {
         MissionThreadState::Failed
     } else if thread.is_waiting_for_confirmation() {
         MissionThreadState::Waiting
@@ -195,6 +207,47 @@ fn selected_thread_specs(entries: &[MissionAgentEntry], cx: &App) -> Vec<Mission
         })
         .filter(|entry| !entry.role.is_empty())
         .collect()
+}
+
+/// Roles are how a Mission's workers are matched up for conflict authorship,
+/// Evidence, and Dashboard filtering (see `mission_panel::worker_label` and
+/// friends), so two workers sharing one normalized role would silently merge
+/// into a single identity in those views. Comparison ignores case and
+/// surrounding whitespace, matching how `role`s are trimmed when saved.
+fn normalized_role(role: &str) -> String {
+    role.trim().to_lowercase()
+}
+
+/// The first role in `specs` that either repeats within `specs` itself, or
+/// collides with a role already used by a live thread in `mission_id`
+/// (relevant when adding workers to an existing Mission). `None` when every
+/// role is unique.
+fn duplicate_role(
+    specs: &[MissionThreadSpec],
+    mission_id: Option<MissionId>,
+    cx: &App,
+) -> Option<String> {
+    let mut seen: HashSet<String> = HashSet::default();
+    if let Some(mission_id) = mission_id
+        && let Some(store) = ThreadMetadataStore::try_global(cx)
+    {
+        seen.extend(
+            store
+                .read(cx)
+                .entries()
+                .filter(|metadata| metadata.mission_id == Some(mission_id))
+                .filter_map(|metadata| metadata.role.as_deref())
+                .map(normalized_role),
+        );
+    }
+
+    for spec in specs {
+        let key = normalized_role(&spec.role);
+        if !seen.insert(key) {
+            return Some(spec.role.clone());
+        }
+    }
+    None
 }
 
 #[derive(Clone)]
@@ -363,6 +416,18 @@ impl MissionOrchestratorModal {
         }
         if specs.is_empty() {
             self.error = Some("Select at least one Harness and provide a role.".into());
+            cx.notify();
+            return;
+        }
+        if let Some(duplicate) = duplicate_role(
+            &specs,
+            existing_mission.as_ref().map(|mission| mission.id),
+            cx,
+        ) {
+            self.error = Some(
+                format!("\"{duplicate}\" is already a role in this Mission. Roles must be unique.")
+                    .into(),
+            );
             cx.notify();
             return;
         }

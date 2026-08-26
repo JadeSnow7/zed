@@ -14,6 +14,7 @@
 //! empty the queue out from under the user.
 
 use chrono::{DateTime, Utc};
+use collections::HashSet;
 use gpui::{
     AnyElement, App, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Subscription,
     WeakEntity, Window,
@@ -30,9 +31,9 @@ use crate::{
     mission_panel::{
         MissionChange, MissionContextState, MissionSnapshot, WorkerRow, bilingual_label,
         evidence_is_stale, format_token_count, mission_context_state_from_result, mission_snapshot,
-        relative_time, section_header, send_to_worker,
+        relative_time, section_header, send_to_worker, show_mission_warning_toast,
     },
-    thread_metadata_store::{Mission, MissionId, ThreadMetadata, ThreadMetadataStore},
+    thread_metadata_store::{Mission, MissionId, ThreadId, ThreadMetadata, ThreadMetadataStore},
     worker_dashboard::authorize_worker,
 };
 
@@ -104,7 +105,7 @@ fn short_mission_id(mission_id: MissionId) -> String {
 
 // --- Shared Context ---------------------------------------------------------
 
-pub struct SharedContextView {
+pub(crate) struct SharedContextView {
     mission: Mission,
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
@@ -450,7 +451,7 @@ impl Item for SharedContextView {
 
 // --- Evidence ---------------------------------------------------------------
 
-pub struct EvidenceView {
+pub(crate) struct EvidenceView {
     mission: Mission,
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
@@ -763,7 +764,7 @@ impl Item for EvidenceView {
 
 // --- The human teammate's queue --------------------------------------------
 
-pub struct MissionQueueView {
+pub(crate) struct MissionQueueView {
     mission: Mission,
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
@@ -772,6 +773,12 @@ pub struct MissionQueueView {
     /// a worker raises it rather than at the next refresh.
     _worker_subscriptions: Vec<Subscription>,
     _panel_observation: Option<Subscription>,
+    /// Thread IDs currently held via `AgentPanel::pin_thread`, so a worker
+    /// that goes idle while the queue is open isn't evicted out from under
+    /// the user (see the module doc comment). Diffed against the Mission's
+    /// worker set on every `sync_worker_subscriptions`, and released in full
+    /// by the `on_release` hook set up in `new`.
+    pinned_thread_ids: HashSet<ThreadId>,
 }
 
 impl MissionQueueView {
@@ -816,6 +823,7 @@ impl MissionQueueView {
             comment_editor,
             _worker_subscriptions: Vec::new(),
             _panel_observation: None,
+            pinned_thread_ids: HashSet::default(),
         };
 
         if let Some(panel) = agent_panel {
@@ -823,6 +831,23 @@ impl MissionQueueView {
                 this.sync_worker_subscriptions(cx);
             }));
         }
+        cx.on_release({
+            let workspace = this.workspace.clone();
+            move |this, cx| {
+                let Some(panel) = workspace
+                    .upgrade()
+                    .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx))
+                else {
+                    return;
+                };
+                panel.update(cx, |panel, cx| {
+                    for thread_id in this.pinned_thread_ids.drain() {
+                        panel.unpin_thread(thread_id, cx);
+                    }
+                });
+            }
+        })
+        .detach();
         // Deferred because `deploy` runs inside a `Workspace` update, and the
         // snapshot this needs has to read that same workspace back out.
         cx.spawn(async move |this, cx| {
@@ -834,8 +859,29 @@ impl MissionQueueView {
     }
 
     fn sync_worker_subscriptions(&mut self, cx: &mut Context<Self>) {
-        self._worker_subscriptions = mission_snapshot(&self.mission, &self.workspace, cx)
-            .workers
+        let workers = mission_snapshot(&self.mission, &self.workspace, cx).workers;
+
+        if let Some(panel) = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).panel::<AgentPanel>(cx))
+        {
+            let current_thread_ids: HashSet<ThreadId> = workers
+                .iter()
+                .map(|worker| worker.metadata.thread_id)
+                .collect();
+            panel.update(cx, |panel, cx| {
+                for thread_id in current_thread_ids.difference(&self.pinned_thread_ids) {
+                    panel.pin_thread(*thread_id);
+                }
+                for thread_id in self.pinned_thread_ids.difference(&current_thread_ids) {
+                    panel.unpin_thread(*thread_id, cx);
+                }
+            });
+            self.pinned_thread_ids = current_thread_ids;
+        }
+
+        self._worker_subscriptions = workers
             .into_iter()
             .filter_map(|worker| worker.thread)
             .map(|thread| cx.observe(&thread, |_, _, cx| cx.notify()))
@@ -853,41 +899,63 @@ impl MissionQueueView {
         }
 
         let workers = mission_snapshot(&self.mission, &self.workspace, cx).workers;
-        let mut delivered = false;
-        for worker in workers {
-            let Some(thread) = worker.thread else {
-                continue;
-            };
-            send_to_worker(&thread, comment.clone(), cx);
-            delivered = true;
-        }
+        let unloaded = workers
+            .iter()
+            .filter(|worker| worker.thread_view.is_none())
+            .count();
+        let sends: Vec<_> = workers
+            .into_iter()
+            .filter_map(|worker| worker.thread_view)
+            .map(|thread_view| send_to_worker(&thread_view, comment.clone(), window, cx))
+            .collect();
+        let total = sends.len();
 
-        if delivered {
-            self.comment_editor
-                .update(cx, |editor, cx| editor.clear(window, cx));
-        }
-        cx.notify();
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let results = futures::future::join_all(sends).await;
+            let failed = results.iter().filter(|result| result.is_err()).count();
+            this.update_in(cx, |this, window, cx| {
+                // Only clear the composer once at least one send actually
+                // went out, so a total failure leaves the comment intact to
+                // retry rather than silently discarding it.
+                if failed < total {
+                    this.comment_editor
+                        .update(cx, |editor, cx| editor.clear(window, cx));
+                }
+                if failed > 0 || unloaded > 0 {
+                    let sent = total - failed;
+                    show_mission_warning_toast(
+                        &workspace,
+                        format!(
+                            "Sent to {sent}/{total} worker(s); {failed} failed, {unloaded} not loaded."
+                        ),
+                        cx,
+                    );
+                }
+                cx.notify();
+            })
+        })
+        .detach();
     }
 
-    /// Opens the diff for a contended file. The Mission's workers share one
-    /// working tree, so there is no second revision to diff against; the
-    /// honest thing to show is the first author's diff versus HEAD, with the
-    /// contention called out beside it.
-    fn open_conflict_diff(&mut self, file_name: &str, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens the diff for a contended file's first author. The Mission's
+    /// workers share one working tree, so there is no second revision to
+    /// diff against; the honest thing to show is the first author's diff
+    /// versus HEAD, with the contention called out beside it. Identified by
+    /// `ThreadId` (not a file basename) so this can't land on the wrong
+    /// worker when two files share a name in different directories.
+    fn open_conflict_diff(
+        &mut self,
+        author_thread_id: ThreadId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let snapshot = mission_snapshot(&self.mission, &self.workspace, cx);
         let Some(thread) = snapshot
-            .changes
+            .workers
             .iter()
-            .find(|change| change.name == file_name)
-            .and_then(|change| change.workers.first())
-            .and_then(|author| {
-                snapshot
-                    .workers
-                    .iter()
-                    .find(|worker| &worker.label == author)?
-                    .thread
-                    .clone()
-            })
+            .find(|worker| worker.metadata.thread_id == author_thread_id)
+            .and_then(|worker| worker.thread.clone())
         else {
             return;
         };
@@ -974,8 +1042,13 @@ impl MissionQueueView {
 
     fn render_conflict_card(&self, change: &MissionChange, cx: &mut Context<Self>) -> AnyElement {
         let name = change.name.clone();
-        let authors = change.workers.join(" vs ");
-        let change_name = change.name.clone();
+        let authors = change
+            .workers
+            .iter()
+            .map(|(_, label)| label.to_string())
+            .collect::<Vec<_>>()
+            .join(" vs ");
+        let first_author = change.workers.first().map(|(thread_id, _)| *thread_id);
 
         v_flex()
             .w_full()
@@ -1015,7 +1088,9 @@ impl MissionQueueView {
                             "The Mission's workers share one working tree, so this shows the first author's diff against HEAD",
                         ))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_conflict_diff(&change_name, window, cx);
+                            if let Some(author_thread_id) = first_author {
+                                this.open_conflict_diff(author_thread_id, window, cx);
+                            }
                         })),
                 ),
             )
@@ -1245,6 +1320,11 @@ fn empty_body(message: &'static str, _cx: &App) -> AnyElement {
 pub struct MissionStatusIndicator {
     workspace: WeakEntity<Workspace>,
     mission: Option<Mission>,
+    /// One per live worker thread of `mission`, so the status bar redraws
+    /// the moment a worker's state changes rather than waiting for the next
+    /// 5-second poll. Rebuilt whenever the Mission or its worker set might
+    /// have changed.
+    _worker_subscriptions: Vec<Subscription>,
     _refresh: gpui::Task<()>,
 }
 
@@ -1253,15 +1333,32 @@ impl MissionStatusIndicator {
         Self {
             workspace,
             mission: None,
+            _worker_subscriptions: Vec::new(),
             _refresh: Self::spawn_refresh(cx),
         }
+    }
+
+    fn sync_worker_subscriptions(&mut self, cx: &mut Context<Self>) {
+        let Some(mission) = self.mission.clone() else {
+            self._worker_subscriptions.clear();
+            return;
+        };
+        self._worker_subscriptions = mission_snapshot(&mission, &self.workspace, cx)
+            .workers
+            .into_iter()
+            .filter_map(|worker| worker.thread)
+            .map(|thread| cx.observe(&thread, |_, _, cx| cx.notify()))
+            .collect();
     }
 
     /// Missions are created rarely and `ThreadMetadataStore` publishes no
     /// change events, so the indicator re-reads the Mission list on a slow
     /// timer rather than trying to observe a store that can't be observed.
-    /// Everything that changes second-to-second comes from the live threads,
-    /// which are read on every render.
+    /// Everything that changes second-to-second comes from the live worker
+    /// threads, which are subscribed to directly (see
+    /// `sync_worker_subscriptions`); the unconditional `cx.notify()` here is
+    /// just a fallback so a missed subscription can't leave the status bar
+    /// stuck on a stale count for more than one tick.
     fn spawn_refresh(cx: &mut Context<Self>) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
@@ -1273,25 +1370,28 @@ impl MissionStatusIndicator {
                     .ok()
                     .flatten();
 
-                if let Some(missions) = missions {
-                    let newest = missions.await.ok().and_then(|missions| {
+                let newest = match missions {
+                    Some(missions) => missions.await.ok().and_then(|missions| {
                         missions
                             .into_iter()
                             .max_by_key(|mission| mission.created_at)
-                    });
-                    if this
-                        .update(cx, |this, cx| {
-                            if this.mission.as_ref().map(|mission| mission.id)
-                                != newest.as_ref().map(|mission| mission.id)
-                            {
-                                this.mission = newest;
-                                cx.notify();
-                            }
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
+                    }),
+                    None => None,
+                };
+
+                if this
+                    .update(cx, |this, cx| {
+                        if this.mission.as_ref().map(|mission| mission.id)
+                            != newest.as_ref().map(|mission| mission.id)
+                        {
+                            this.mission = newest;
+                        }
+                        this.sync_worker_subscriptions(cx);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
                 }
 
                 cx.background_executor()
@@ -1362,5 +1462,18 @@ impl workspace::StatusItemView for MissionStatusIndicator {
         // Hides itself when the workspace has no Mission, so there is nothing
         // for the user to turn off.
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_mission_id_is_the_first_eight_characters() {
+        let mission_id = MissionId::new();
+        let short = short_mission_id(mission_id);
+        assert_eq!(short.len(), 8);
+        assert!(mission_id.to_key_string().starts_with(&short));
     }
 }

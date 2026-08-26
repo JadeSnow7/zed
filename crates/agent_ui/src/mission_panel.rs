@@ -39,7 +39,7 @@ use gpui::{
     Focusable, IntoElement, ParentElement, Pixels, Render, SharedString, SharedUri, Styled,
     Subscription, Task, WeakEntity, Window, div, px,
 };
-use project::AgentServerStore;
+use project::{AgentServerStore, ProjectGroupKey, ProjectPath};
 use ui::{
     Avatar, Color, ContextMenu, Divider, Icon, IconButton, IconName, IconSize, Indicator, Label,
     LabelSize, ListItem, ListItemSpacing, PopoverMenu, Tooltip, prelude::*,
@@ -52,6 +52,7 @@ use workspace::{
 
 use crate::{
     Agent, AgentPanel, AgentThreadSource, CreateMission, MissionState, MissionThreadState,
+    conversation_view::ThreadView,
     mission_context_observer::shared_context_store,
     mission_state,
     mission_views::{EvidenceView, MissionQueueView, SharedContextView},
@@ -110,13 +111,21 @@ pub fn build_mission_tree(
 }
 
 /// One file a Mission's workers changed, aggregated across all of them.
+/// Keyed by the full `ProjectPath`, not `name` (a basename): two files with
+/// the same basename in different directories must never be merged into one
+/// entry or hand the diff viewer the wrong file.
 #[derive(Debug, PartialEq, Eq)]
 pub struct MissionChange {
+    pub path: ProjectPath,
+    /// Basename, for display only. Use `path` for identity and for opening
+    /// the file.
     pub name: String,
     pub lines_added: u32,
     pub lines_removed: u32,
-    /// Every worker that touched this file, in the order first seen.
-    pub workers: Vec<SharedString>,
+    /// Every worker that touched this file, in the order first seen. Keyed
+    /// by `ThreadId` so two workers sharing a display label (Mission roles
+    /// aren't required to be unique) are still counted as distinct authors.
+    pub workers: Vec<(ThreadId, SharedString)>,
 }
 
 impl MissionChange {
@@ -131,7 +140,9 @@ impl MissionChange {
 /// One worker's edit to one file, as read off its `ActionLog`.
 #[derive(Debug)]
 pub struct WorkerFileChange {
-    pub worker: SharedString,
+    pub worker_thread_id: ThreadId,
+    pub worker_label: SharedString,
+    pub path: ProjectPath,
     pub name: String,
     pub lines_added: u32,
     pub lines_removed: u32,
@@ -139,16 +150,19 @@ pub struct WorkerFileChange {
 
 /// Folds each worker's changed files into one per-file view of the Mission,
 /// summing line counts and recording which workers touched each file. Sorted
-/// by name so the panel doesn't reshuffle between renders as workers report
-/// their changes in whatever order `changed_buffers` happens to yield.
+/// by name (then by path, to break ties between same-named files in
+/// different directories) so the panel doesn't reshuffle between renders as
+/// workers report their changes in whatever order `changed_buffers` happens
+/// to yield.
 pub fn merge_worker_changes(
     changes: impl IntoIterator<Item = WorkerFileChange>,
 ) -> Vec<MissionChange> {
-    let mut by_name: HashMap<String, MissionChange> = HashMap::default();
+    let mut by_path: HashMap<ProjectPath, MissionChange> = HashMap::default();
     for change in changes {
-        let entry = by_name
-            .entry(change.name.clone())
+        let entry = by_path
+            .entry(change.path.clone())
             .or_insert_with(|| MissionChange {
+                path: change.path.clone(),
                 name: change.name,
                 lines_added: 0,
                 lines_removed: 0,
@@ -156,13 +170,19 @@ pub fn merge_worker_changes(
             });
         entry.lines_added += change.lines_added;
         entry.lines_removed += change.lines_removed;
-        if !entry.workers.contains(&change.worker) {
-            entry.workers.push(change.worker);
+        if !entry
+            .workers
+            .iter()
+            .any(|(thread_id, _)| *thread_id == change.worker_thread_id)
+        {
+            entry
+                .workers
+                .push((change.worker_thread_id, change.worker_label));
         }
     }
 
-    let mut merged: Vec<_> = by_name.into_values().collect();
-    merged.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut merged: Vec<_> = by_path.into_values().collect();
+    merged.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
     merged
 }
 
@@ -170,9 +190,9 @@ pub fn merge_worker_changes(
 /// file count so "5 files" reads differently when one worker wrote them all
 /// than when four did.
 pub fn change_author_count(changes: &[MissionChange]) -> usize {
-    let mut authors: HashSet<&SharedString> = HashSet::default();
+    let mut authors: HashSet<ThreadId> = HashSet::default();
     for change in changes {
-        authors.extend(change.workers.iter());
+        authors.extend(change.workers.iter().map(|(thread_id, _)| *thread_id));
     }
     authors.len()
 }
@@ -279,6 +299,9 @@ pub enum MissionPanelEvent {
 pub struct WorkerRow {
     pub metadata: ThreadMetadata,
     pub thread: Option<Entity<AcpThread>>,
+    /// The worker's `ThreadView`, used to send it a message so an in-flight
+    /// turn is queued rather than cancelled; see `send_to_worker`.
+    pub thread_view: Option<Entity<ThreadView>>,
     pub label: SharedString,
     pub harness: SharedString,
     /// What the worker is doing right now: its active tool call, or the fact
@@ -410,6 +433,16 @@ pub struct MissionPanel {
     /// the attention counts track generation rather than waiting for the next
     /// pull-based refresh. Rebuilt whenever the selected Mission changes.
     _worker_subscriptions: Vec<Subscription>,
+    /// Set when the last `list_missions` call failed, so the panel can show
+    /// an explicit "couldn't load" state instead of quietly rendering as if
+    /// the workspace simply has no Missions. Cleared on the next successful
+    /// refresh.
+    load_error: Option<SharedString>,
+    /// The in-flight Shared Context query, if any. Replacing this drops (and
+    /// so cancels) whatever query was previously running, so a slow query
+    /// for a Mission the user has since navigated away from can never land
+    /// after — and overwrite — a later, faster one's result.
+    _context_refresh_task: Option<Task<()>>,
     /// The dock panel refreshes when it becomes active; the sidebar view has
     /// no such hook, so both watch `ThreadMetadataStore` instead. Missions and
     /// workers are created through it, so a new worker shows up without the
@@ -448,6 +481,8 @@ impl MissionPanel {
             new_task_editor,
             new_task_open: false,
             _worker_subscriptions: Vec::new(),
+            load_error: None,
+            _context_refresh_task: None,
             _metadata_observation: observe_metadata_store(window, cx),
         }
     }
@@ -478,6 +513,8 @@ impl MissionPanel {
             new_task_editor,
             new_task_open: false,
             _worker_subscriptions: Vec::new(),
+            load_error: None,
+            _context_refresh_task: None,
             _metadata_observation: observe_metadata_store(window, cx),
         };
         this.refresh(window, cx);
@@ -504,21 +541,73 @@ impl MissionPanel {
         workspace.toggle_panel_focus::<Self>(window, cx);
     }
 
+    /// The `ProjectGroupKey` of the workspace this panel is bound to, used to
+    /// scope Missions and their threads to that workspace. `None` when the
+    /// workspace has already been dropped (panel about to be torn down).
+    fn workspace_group_key(&self, cx: &App) -> Option<ProjectGroupKey> {
+        let workspace = self.workspace.upgrade()?;
+        Some(workspace.read(cx).project().read(cx).project_group_key(cx))
+    }
+
     /// Reloads the Mission list and thread metadata. Called when the panel
     /// becomes active and after a Mission is created; see the module-level
     /// doc comment for why this is pull- rather than push-based.
+    ///
+    /// Missions have no identity of their own, so scoping to this panel's
+    /// workspace works by filtering member threads to those whose worktree
+    /// paths match this workspace, then keeping only Missions that still
+    /// have at least one thread after that filter. A Mission always gets its
+    /// first thread created synchronously as part of Mission creation (see
+    /// `mission_orchestrator::create_mission`), so this never drops a
+    /// genuinely-empty-but-valid Mission for the workspace it was made in.
     pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(store) = ThreadMetadataStore::try_global(cx) else {
             return;
         };
         let missions_task = store.read(cx).list_missions(cx);
+        let group_key = self.workspace_group_key(cx);
         cx.spawn_in(window, async move |this, cx| {
-            let missions = missions_task.await.unwrap_or_default();
+            let missions_result = missions_task.await;
             this.update(cx, |this, cx| {
+                let missions = match missions_result {
+                    Ok(missions) => {
+                        this.load_error = None;
+                        missions
+                    }
+                    Err(error) => {
+                        // Keep the last-known tree rather than blanking it,
+                        // so a transient read failure doesn't look like the
+                        // workspace suddenly has no Missions.
+                        this.load_error = Some(format!("Couldn't load Missions: {error:#}").into());
+                        cx.notify();
+                        return;
+                    }
+                };
                 let Some(store) = ThreadMetadataStore::try_global(cx) else {
                     return;
                 };
-                let threads: Vec<ThreadMetadata> = store.read(cx).entries().cloned().collect();
+                let threads: Vec<ThreadMetadata> = store
+                    .read(cx)
+                    .entries()
+                    .filter(|metadata| match &group_key {
+                        Some(key) => {
+                            &ProjectGroupKey::from_worktree_paths(
+                                &metadata.worktree_paths,
+                                metadata.remote_connection.clone(),
+                            ) == key
+                        }
+                        None => false,
+                    })
+                    .cloned()
+                    .collect();
+                let mission_ids: HashSet<MissionId> = threads
+                    .iter()
+                    .filter_map(|thread| thread.mission_id)
+                    .collect();
+                let missions = missions
+                    .into_iter()
+                    .filter(|mission| mission_ids.contains(&mission.id))
+                    .collect();
                 this.tree = build_mission_tree(missions, threads);
 
                 if let Some(mission_id) = this.selected_mission
@@ -557,6 +646,7 @@ impl MissionPanel {
         self.context_state = MissionContextState::Loading;
         let Some(store) = shared_context_store(cx) else {
             self.context_state = MissionContextState::Unavailable;
+            self._context_refresh_task = None;
             cx.notify();
             return;
         };
@@ -566,15 +656,21 @@ impl MissionPanel {
                 shared_context::MissionId::from_key_string(&mission_key).ok()?;
             Some(store.get_mission_context(shared_mission_id, None))
         });
-        cx.spawn(async move |this, cx| {
+        // Assigning here drops whatever refresh was previously in flight
+        // (see the field doc comment); the `selected_mission` check below is
+        // a second guard against the narrow window between that drop
+        // actually cancelling the old future and this one's result landing.
+        self._context_refresh_task = Some(cx.spawn(async move |this, cx| {
             let result = query.await;
             this.update(cx, |this, cx| {
+                if this.selected_mission != Some(mission_id) {
+                    return;
+                }
                 this.context_state = mission_context_state_from_result(result);
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
+        }));
     }
 
     fn select_mission(&mut self, mission_id: MissionId, cx: &mut Context<Self>) {
@@ -768,18 +864,33 @@ impl MissionPanel {
             return;
         }
 
-        let Some(thread) = worker.thread.clone() else {
+        let Some(thread_view) = worker.thread_view.clone() else {
             // Without a live thread there is nothing to send to, so open the
             // worker's conversation and leave the text for the user.
             self.activate_thread(worker.metadata.clone(), window, cx);
             return;
         };
 
-        send_to_worker(&thread, task, cx);
-        self.new_task_editor
-            .update(cx, |editor, cx| editor.clear(window, cx));
-        self.new_task_open = false;
-        cx.notify();
+        let send = send_to_worker(&thread_view, task, window, cx);
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = send.await;
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    // Only clear the composer once the message has actually
+                    // gone out, so a failure leaves the user's text intact
+                    // to retry rather than silently discarding it.
+                    Ok(()) => {
+                        this.new_task_editor
+                            .update(cx, |editor, cx| editor.clear(window, cx));
+                        this.new_task_open = false;
+                    }
+                    Err(error) => show_send_failed_toast(&workspace, error, cx),
+                }
+                cx.notify();
+            })
+        })
+        .detach();
     }
 
     fn toggle_new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -810,6 +921,33 @@ impl MissionPanel {
 // --- rendering ---
 
 impl MissionPanel {
+    /// A dismissible-looking banner (there is no dismiss; it clears itself on
+    /// the next successful `refresh`) for when the Mission list failed to
+    /// load, so that state reads as "couldn't load" rather than silently as
+    /// "no Missions here".
+    fn render_load_error(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let error = self.load_error.clone()?;
+        Some(
+            h_flex()
+                .w_full()
+                .gap_1p5()
+                .px_2()
+                .py_1()
+                .bg(cx.theme().status().warning_background)
+                .child(
+                    Icon::new(IconName::Warning)
+                        .size(IconSize::Small)
+                        .color(Color::Warning),
+                )
+                .child(
+                    Label::new(error)
+                        .size(LabelSize::Small)
+                        .color(Color::Warning),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_header(&self, snapshot: &MissionSnapshot, cx: &mut Context<Self>) -> AnyElement {
         let title: SharedString = snapshot
             .mission
@@ -1248,12 +1386,17 @@ impl MissionPanel {
                 .child(section_header("CHANGES", "变更", Some(meta.into())));
 
         for change in &snapshot.changes {
-            let workers = change.workers.join(" and ");
-            let thread = change.workers.first().and_then(|author| {
+            let workers = change
+                .workers
+                .iter()
+                .map(|(_, label)| label.to_string())
+                .collect::<Vec<_>>()
+                .join(" and ");
+            let thread = change.workers.first().and_then(|(author_thread_id, _)| {
                 snapshot
                     .workers
                     .iter()
-                    .find(|worker| &worker.label == author)?
+                    .find(|worker| worker.metadata.thread_id == *author_thread_id)?
                     .thread
                     .clone()
             });
@@ -1510,13 +1653,16 @@ pub fn mission_snapshot(
     let workers: Vec<WorkerRow> = threads
         .into_iter()
         .map(|metadata| {
-            let thread = panel.as_ref().and_then(|panel| {
+            let thread_view = panel.as_ref().and_then(|panel| {
                 panel
                     .read(cx)
                     .conversation_view_for_id(&metadata.thread_id, cx)?
                     .read(cx)
-                    .root_thread(cx)
+                    .root_thread_view()
             });
+            let thread = thread_view
+                .as_ref()
+                .map(|thread_view| thread_view.read(cx).thread.clone());
             let state = panel
                 .as_ref()
                 .map(|panel| thread_mission_state(panel.read(cx), metadata.thread_id, cx))
@@ -1553,6 +1699,7 @@ pub fn mission_snapshot(
                     .and_then(|thread| last_assistant_summary(thread.read(cx), cx)),
                 metadata,
                 thread,
+                thread_view,
             }
         })
         .collect();
@@ -1567,14 +1714,18 @@ pub fn mission_snapshot(
             .read(cx)
             .changed_buffers(cx)
             .filter_map(|(buffer, diff)| {
-                let path = buffer.read(cx).file()?.path().clone();
+                let file = buffer.read(cx).file()?;
+                let project_path = ProjectPath::from_file(file.as_ref(), cx);
                 let stats = action_log::DiffStats::single_file(diff.read(cx));
                 Some(WorkerFileChange {
-                    worker: worker.label.clone(),
-                    name: path
+                    worker_thread_id: worker.metadata.thread_id,
+                    worker_label: worker.label.clone(),
+                    name: file
+                        .path()
                         .file_name()
-                        .unwrap_or_else(|| path.as_unix_str())
+                        .unwrap_or_else(|| file.path().as_unix_str())
                         .to_string(),
+                    path: project_path,
                     lines_added: stats.lines_added,
                     lines_removed: stats.lines_removed,
                 })
@@ -1599,16 +1750,69 @@ pub fn mission_snapshot(
     }
 }
 
-/// Sends `message` to a worker's thread as an ordinary user turn.
-/// `AcpThread::send` hands back a bare future rather than a `Task`, so it has
-/// to be driven somewhere; every caller here is a fire-and-forget button, so
-/// a failure is logged rather than propagated.
-pub fn send_to_worker(thread: &Entity<AcpThread>, message: String, cx: &mut App) {
-    let send = thread.update(cx, |thread, cx| thread.send(vec![message.into()], cx));
-    cx.background_spawn(async move {
-        send.await.log_err();
-    })
-    .detach();
+/// Sends `message` to a worker's thread as an ordinary user turn when the
+/// worker is idle, or queues it as a follow-up otherwise. A worker that is
+/// generating or waiting on a permission has a turn in flight; sending
+/// through `AcpThread::send` directly would cancel that turn with
+/// `InterruptedByFollowUp` the same way a second concurrent instruction
+/// would, so this mirrors the follow-up queue a user's own composer uses
+/// instead.
+pub fn send_to_worker(
+    thread_view: &Entity<ThreadView>,
+    message: String,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<anyhow::Result<()>> {
+    let is_idle = thread_view.read(cx).thread.read(cx).status() == acp_thread::ThreadStatus::Idle;
+    if is_idle {
+        let send = thread_view.update(cx, |view, cx| {
+            view.thread
+                .update(cx, |thread, cx| thread.send(vec![message.into()], cx))
+        });
+        cx.background_spawn(async move { send.await.map(|_| ()) })
+    } else {
+        thread_view.update(cx, |view, cx| {
+            view.add_to_queue(vec![message.into()], Vec::new(), window, cx);
+        });
+        Task::ready(Ok(()))
+    }
+}
+
+/// Surfaces a warning as a dismissible toast on the given workspace, since
+/// Mission buttons that send to a worker's thread have no other place to
+/// report an async failure.
+pub fn show_mission_warning_toast(
+    workspace: &WeakEntity<Workspace>,
+    message: String,
+    cx: &mut App,
+) {
+    let status_toast = notifications::status_toast::StatusToast::new(message, cx, |this, _cx| {
+        this.icon(
+            Icon::new(IconName::Warning)
+                .size(IconSize::Small)
+                .color(Color::Warning),
+        )
+        .dismiss_button(true)
+    });
+    workspace
+        .update(cx, |workspace, cx| {
+            workspace.toggle_status_toast(status_toast, cx);
+        })
+        .log_err();
+}
+
+/// Surfaces a `send_to_worker` failure as a dismissible toast on the given
+/// workspace.
+pub fn show_send_failed_toast(
+    workspace: &WeakEntity<Workspace>,
+    error: anyhow::Error,
+    cx: &mut App,
+) {
+    show_mission_warning_toast(
+        workspace,
+        format!("Could not send to worker: {error:#}"),
+        cx,
+    );
 }
 
 /// How a worker is named across the sidebar and its dashboard tab: its
@@ -1778,6 +1982,7 @@ impl Render for MissionPanel {
                 cx.emit(MissionPanelEvent::ShowThreadList);
             }))
             .child(self.render_header(&snapshot, cx))
+            .children(self.render_load_error(cx))
             .child(self.render_summary(&snapshot, cx))
             .child(
                 v_flex()
@@ -1892,9 +2097,25 @@ mod tests {
         }
     }
 
-    fn change(worker: &str, name: &str, added: u32, removed: u32) -> WorkerFileChange {
+    fn project_path(dir: &str, name: &str) -> ProjectPath {
+        ProjectPath {
+            worktree_id: project::WorktreeId::from_usize(0),
+            path: util::rel_path::RelPath::new_test(&format!("{dir}/{name}")).into_arc(),
+        }
+    }
+
+    fn change(
+        worker_id: ThreadId,
+        worker: &str,
+        dir: &str,
+        name: &str,
+        added: u32,
+        removed: u32,
+    ) -> WorkerFileChange {
         WorkerFileChange {
-            worker: worker.into(),
+            worker_thread_id: worker_id,
+            worker_label: worker.into(),
+            path: project_path(dir, name),
             name: name.to_string(),
             lines_added: added,
             lines_removed: removed,
@@ -1903,9 +2124,25 @@ mod tests {
 
     #[test]
     fn one_worker_per_file_is_never_contended() {
+        let implementation = ThreadId::new();
+        let test = ThreadId::new();
         let merged = merge_worker_changes([
-            change("Implementation", "mission_panel.rs", 142, 31),
-            change("Test", "thread_metadata_store.rs", 34, 8),
+            change(
+                implementation,
+                "Implementation",
+                "crates/agent_ui/src",
+                "mission_panel.rs",
+                142,
+                31,
+            ),
+            change(
+                test,
+                "Test",
+                "crates/agent_ui/src",
+                "thread_metadata_store.rs",
+                34,
+                8,
+            ),
         ]);
 
         assert_eq!(merged.len(), 2);
@@ -1917,17 +2154,46 @@ mod tests {
 
     #[test]
     fn two_workers_on_one_file_contend_and_their_line_counts_sum() {
+        let implementation = ThreadId::new();
+        let review = ThreadId::new();
         let merged = merge_worker_changes([
-            change("Implementation", "mission_panel.rs", 142, 31),
-            change("Review", "mission_panel.rs", 8, 2),
-            change("Review", "shared_context.rs", 21, 6),
+            change(
+                implementation,
+                "Implementation",
+                "crates/agent_ui/src",
+                "mission_panel.rs",
+                142,
+                31,
+            ),
+            change(
+                review,
+                "Review",
+                "crates/agent_ui/src",
+                "mission_panel.rs",
+                8,
+                2,
+            ),
+            change(
+                review,
+                "Review",
+                "crates/agent_ui/src",
+                "shared_context.rs",
+                21,
+                6,
+            ),
         ]);
 
         assert_eq!(merged.len(), 2);
         let contended = &merged[0];
         assert_eq!(contended.name, "mission_panel.rs");
         assert!(contended.is_contended());
-        assert_eq!(contended.workers, vec!["Implementation", "Review"]);
+        assert_eq!(
+            contended.workers,
+            vec![
+                (implementation, SharedString::from("Implementation")),
+                (review, SharedString::from("Review")),
+            ]
+        );
         assert_eq!(contended.lines_added, 150);
         assert_eq!(contended.lines_removed, 33);
         assert!(!merged[1].is_contended());
@@ -1935,28 +2201,82 @@ mod tests {
 
     #[test]
     fn a_worker_editing_one_file_twice_is_still_a_single_author() {
+        let implementation = ThreadId::new();
         let merged = merge_worker_changes([
-            change("Implementation", "mission_panel.rs", 10, 1),
-            change("Implementation", "mission_panel.rs", 5, 2),
+            change(
+                implementation,
+                "Implementation",
+                "crates/agent_ui/src",
+                "mission_panel.rs",
+                10,
+                1,
+            ),
+            change(
+                implementation,
+                "Implementation",
+                "crates/agent_ui/src",
+                "mission_panel.rs",
+                5,
+                2,
+            ),
         ]);
 
         assert_eq!(merged.len(), 1);
         assert!(!merged[0].is_contended());
-        assert_eq!(merged[0].workers, vec!["Implementation"]);
+        assert_eq!(
+            merged[0].workers,
+            vec![(implementation, SharedString::from("Implementation"))]
+        );
         assert_eq!(merged[0].lines_added, 15);
     }
 
     #[test]
     fn the_author_count_counts_workers_not_files() {
+        let implementation = ThreadId::new();
+        let review = ThreadId::new();
         let merged = merge_worker_changes([
-            change("Implementation", "mission_panel.rs", 10, 1),
-            change("Implementation", "shared_context.rs", 5, 2),
-            change("Review", "mission_panel.rs", 1, 1),
+            change(
+                implementation,
+                "Implementation",
+                "crates/agent_ui/src",
+                "mission_panel.rs",
+                10,
+                1,
+            ),
+            change(
+                implementation,
+                "Implementation",
+                "crates/agent_ui/src",
+                "shared_context.rs",
+                5,
+                2,
+            ),
+            change(
+                review,
+                "Review",
+                "crates/agent_ui/src",
+                "mission_panel.rs",
+                1,
+                1,
+            ),
         ]);
 
         assert_eq!(merged.len(), 2);
         assert_eq!(change_author_count(&merged), 2);
         assert_eq!(change_author_count(&[]), 0);
+    }
+
+    #[test]
+    fn same_basename_in_different_directories_is_not_contended() {
+        let backend = ThreadId::new();
+        let tests = ThreadId::new();
+        let merged = merge_worker_changes([
+            change(backend, "Backend", "src", "config.rs", 12, 3),
+            change(tests, "Tests", "tests", "config.rs", 7, 1),
+        ]);
+
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().all(|change| !change.is_contended()));
     }
 
     #[test]
@@ -2301,13 +2621,9 @@ mod tests {
 
         let (shared, evidence, queue) = workspace.read_with(&cx, |workspace, cx| {
             (
-                workspace
-                    .items_of_type::<crate::SharedContextView>(cx)
-                    .next(),
-                workspace.items_of_type::<crate::EvidenceView>(cx).next(),
-                workspace
-                    .items_of_type::<crate::MissionQueueView>(cx)
-                    .next(),
+                workspace.items_of_type::<SharedContextView>(cx).next(),
+                workspace.items_of_type::<EvidenceView>(cx).next(),
+                workspace.items_of_type::<MissionQueueView>(cx).next(),
             )
         });
         let shared = shared.expect("shared context tab should have opened");

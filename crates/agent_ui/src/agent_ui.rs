@@ -91,9 +91,7 @@ pub use mission_orchestrator::{
     MissionState, MissionThreadState, aggregate_mission_state, mission_state, thread_mission_state,
 };
 pub use mission_panel::{MissionPanel, MissionPanelEvent};
-pub use mission_views::{
-    EvidenceView, MissionQueueView, MissionStatusIndicator, SharedContextView,
-};
+pub use mission_views::MissionStatusIndicator;
 pub(crate) use mode_selector::ModeSelector;
 pub(crate) use model_selector::ModelSelector;
 pub(crate) use model_selector_popover::ModelSelectorPopover;
@@ -101,7 +99,6 @@ pub use thread_import::{
     AcpThreadImportOnboarding, CrossChannelImportOnboarding, ThreadImportModal,
     channels_with_threads, import_threads_from_other_channels,
 };
-pub use worker_dashboard::WorkerDashboard;
 use zed_actions;
 pub use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, SwitchWorktree};
 

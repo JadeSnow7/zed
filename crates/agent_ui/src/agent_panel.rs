@@ -4183,13 +4183,13 @@ impl AgentPanel {
 
     /// Keeps `thread_id` in `retained_threads` until a matching `unpin_thread`,
     /// so a surface outside the panel can keep reading the thread's live state.
-    pub fn pin_thread(&mut self, thread_id: ThreadId) {
+    pub(crate) fn pin_thread(&mut self, thread_id: ThreadId) {
         *self.pinned_threads.entry(thread_id).or_insert(0) += 1;
     }
 
     /// Releases one `pin_thread` hold. The thread becomes evictable again once
     /// the last hold is released.
-    pub fn unpin_thread(&mut self, thread_id: ThreadId, cx: &App) {
+    pub(crate) fn unpin_thread(&mut self, thread_id: ThreadId, cx: &App) {
         let Some(count) = self.pinned_threads.get_mut(&thread_id) else {
             return;
         };

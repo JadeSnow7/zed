@@ -9,7 +9,7 @@ use agent_ui::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, terminal_title_prefix,
 };
 use agent_ui::thread_metadata_store::{
-    ThreadMetadata, ThreadMetadataStore, WorktreePaths, worktree_info_from_thread_paths,
+    MissionId, ThreadMetadata, ThreadMetadataStore, WorktreePaths, worktree_info_from_thread_paths,
 };
 use agent_ui::threads_archive_view::{
     ThreadsArchiveView, ThreadsArchiveViewEvent, format_history_entry_timestamp,
@@ -832,6 +832,13 @@ impl Sidebar {
                     this.sync_active_entry_from_active_workspace(cx);
                     this.replace_archived_panel_thread(window, cx);
                     this.schedule_update_entries(false, cx);
+                    // The Mission panel is bound to the workspace it was
+                    // built for (see `show_missions`), so it has to be
+                    // rebuilt against the new active workspace rather than
+                    // left pointed at the one the user just left.
+                    if matches!(this.view, SidebarView::Mission(_)) {
+                        this.show_missions(window, cx);
+                    }
                 }
                 MultiWorkspaceEvent::WorkspaceAdded(workspace) => {
                     this.subscribe_to_workspace(workspace, window, cx);
@@ -7591,6 +7598,7 @@ impl Sidebar {
             },
         );
 
+        self._subscriptions.clear();
         self._subscriptions.push(subscription);
         self.view = SidebarView::Mission(panel);
         self.serialize(cx);
@@ -7659,6 +7667,7 @@ impl Sidebar {
             },
         );
 
+        self._subscriptions.clear();
         self._subscriptions.push(subscription);
         self.view = SidebarView::Archive(archive_view.clone());
         archive_view.update(cx, |view, cx| view.focus_filter_editor(window, cx));
@@ -7675,10 +7684,32 @@ impl Sidebar {
             return;
         };
         let missions = store.read(cx).list_missions(cx);
+        let group_key = self.active_project_group_key(cx);
         cx.spawn_in(window, async move |this, cx| {
-            let has_missions = missions
-                .await
-                .map(|missions| !missions.is_empty())
+            let missions = missions.await.unwrap_or_default();
+            let has_missions = this
+                .update(cx, |_this, cx| {
+                    let Some(store) = ThreadMetadataStore::try_global(cx) else {
+                        return false;
+                    };
+                    let mission_ids: HashSet<MissionId> = store
+                        .read(cx)
+                        .entries()
+                        .filter(|metadata| match &group_key {
+                            Some(key) => {
+                                &ProjectGroupKey::from_worktree_paths(
+                                    &metadata.worktree_paths,
+                                    metadata.remote_connection.clone(),
+                                ) == key
+                            }
+                            None => false,
+                        })
+                        .filter_map(|metadata| metadata.mission_id)
+                        .collect();
+                    missions
+                        .iter()
+                        .any(|mission| mission_ids.contains(&mission.id))
+                })
                 .unwrap_or(false);
             if !has_missions {
                 return;
