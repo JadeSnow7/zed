@@ -134,6 +134,10 @@ jobs:
     name: Build Linux tarball (dev channel) + smoke check
     runs-on: ubuntu-22.04
     timeout-minutes: 240
+    env:
+      CARGO_INCREMENTAL: 0
+      CC: clang-18
+      CXX: clang++-18
 
     steps:
       # A cold-cache release build of the whole workspace needs far more than the
@@ -148,6 +152,23 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Ensure Clang 18 is available
+        run: |
+          set -euo pipefail
+          if ! command -v clang-18 >/dev/null 2>&1 || ! command -v clang++-18 >/dev/null 2>&1; then
+            sudo install -d -m 0755 /etc/apt/keyrings
+            curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+              | sudo tee /etc/apt/keyrings/llvm.gpg >/dev/null
+            echo "deb [signed-by=/etc/apt/keyrings/llvm.gpg] https://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" \
+              | sudo tee /etc/apt/sources.list.d/llvm-18.list >/dev/null
+            sudo apt-get update
+            sudo apt-get install -y clang-18
+          fi
+          command -v clang-18
+          command -v clang++-18
+          clang-18 --version
+          clang++-18 --version
 
       - name: Install Linux build dependencies
         run: ./script/linux
@@ -374,6 +395,7 @@ jobs:
           )
           gh release create "dev-${GITHUB_RUN_ID}" \
             release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" \
             --title "Zed Dev Build ${GITHUB_RUN_NUMBER}" \
             --prerelease \
