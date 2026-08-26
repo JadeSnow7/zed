@@ -40,8 +40,31 @@ function Get-VSArch {
     }
 }
 
+function Get-VsDevShellScript {
+    # Zed's own runners have the Community edition at a fixed path, but
+    # GitHub-hosted images ship Enterprise, so locate the install with vswhere
+    # rather than hardcoding an edition.
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (Test-Path $vswhere) {
+        $installPath = & $vswhere -latest -products '*' -property installationPath
+        if ($installPath) {
+            $candidate = Join-Path $installPath "Common7\Tools\Launch-VsDevShell.ps1"
+            if (Test-Path $candidate) {
+                return $candidate
+            }
+        }
+    }
+
+    $fallback = "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1"
+    if (Test-Path $fallback) {
+        return $fallback
+    }
+
+    throw "Could not locate Launch-VsDevShell.ps1; is Visual Studio 2022 installed?"
+}
+
 Push-Location
-& "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
+& (Get-VsDevShellScript) -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
 Pop-Location
 
 $target = "$Architecture-pc-windows-msvc"
@@ -194,6 +217,24 @@ function UploadToSentry {
     }
 }
 
+function Get-WindowsSdkBinDir {
+    # Runner images pin different SDK builds, so pick the newest installed one
+    # that actually ships makeAppx.exe instead of hardcoding a version.
+    $sdkRoot = Join-Path ${env:ProgramFiles(x86)} "Windows Kits\10\bin"
+    if (Test-Path $sdkRoot) {
+        $candidate = Get-ChildItem -Path $sdkRoot -Directory -Filter "10.*" |
+            Sort-Object { [version]$_.Name } -Descending |
+            ForEach-Object { Join-Path $_.FullName "x64" } |
+            Where-Object { Test-Path (Join-Path $_ "makeAppx.exe") } |
+            Select-Object -First 1
+        if ($candidate) {
+            return $candidate
+        }
+    }
+
+    throw "Could not locate makeAppx.exe under $sdkRoot; is the Windows 10/11 SDK installed?"
+}
+
 function MakeAppx {
     switch ($channel) {
         "stable" {
@@ -208,7 +249,7 @@ function MakeAppx {
     }
     Copy-Item -Path "$manifestFile" -Destination "$innoDir\make_appx\AppxManifest.xml"
     # Add makeAppx.exe to Path
-    $sdk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64"
+    $sdk = Get-WindowsSdkBinDir
     $env:Path += ';' + $sdk
     makeAppx.exe pack /d "$innoDir\make_appx" /p "$innoDir\zed_explorer_command_injector.appx" /nv
 }
@@ -326,9 +367,21 @@ function BuildInstaller {
     }
 
     # Windows runner 2022 default has iscc in PATH, https://github.com/actions/runner-images/blob/main/images/windows/Windows2022-Readme.md
-    # Currently, we are using Windows 2022 runner.
     # Windows runner 2025 doesn't have iscc in PATH for now, https://github.com/actions/runner-images/issues/11228
-    $innoSetupPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+    # so fall back to the default install locations, and finally to PATH.
+    $innoSetupPath = @(
+        (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+        (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe")
+    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+    if (-not $innoSetupPath) {
+        $iscc = Get-Command "iscc" -ErrorAction SilentlyContinue
+        if (-not $iscc) {
+            Write-Error "Could not locate ISCC.exe; is Inno Setup 6 installed?"
+            exit 1
+        }
+        $innoSetupPath = $iscc.Source
+    }
 
     $definitions = @{
         "AppId"          = $appId

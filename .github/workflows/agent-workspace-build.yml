@@ -1,0 +1,380 @@
+# Not part of Zed's own generated CI (see run_tests.yml, release.yml, etc. — those
+# are gated to `github.repository_owner == 'zed-industries' / 'zed-extensions'` and
+# pinned to Zed's private/paid runner fleet, namespace-profile-* and self-*, none of
+# which this fork has access to). This workflow is hand-written specifically for the
+# feature/* branches built on top of upstream Zed (Mission metadata / Shared Context /
+# Orchestrator / Mission panel), and runs entirely on standard GitHub-hosted runners.
+#
+# It builds full, unsigned "dev" channel bundles for macOS, Linux and Windows via the
+# repo's own script/bundle-* scripts (the same ones Zed's real release pipeline uses —
+# signing is skipped automatically when the signing secrets are absent, it does not
+# fail), runs a headless smoke check against each built CLI binary, and then publishes
+# every platform's artifacts to a single GitHub prerelease.
+#
+# One-time manual step this workflow cannot do for you: GitHub Actions is disabled by
+# default on forks. Go to this repo's "Actions" tab on github.com and click
+# "I understand my workflows, go ahead and enable them" once before this will fire.
+name: agent-workspace-build
+
+on:
+  push:
+    branches:
+      - "feature/**"
+  workflow_dispatch: {}
+
+concurrency:
+  group: agent-workspace-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    name: Build unsigned macOS app (dev channel) + smoke check
+    runs-on: macos-15
+    # Cold-cache full release build of the whole workspace on a standard 3-vCPU
+    # hosted runner (vs. Zed's own paid namespace-profile-mac-large fleet) can
+    # genuinely take well over an hour on the first run. Subsequent runs should be
+    # much faster once Swatinem/rust-cache below has something to restore.
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Report Apple toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          clang --version
+
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Cache cargo-bundle (zed's fork, avoids reinstall every run)
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/cargo-bundle
+          key: cargo-bundle-v0.6.1-zed-macos-${{ runner.arch }}
+
+      - name: Build & bundle macOS app (unsigned dev build)
+        run: script/bundle-mac
+
+      - name: Locate built .app bundle
+        id: locate_app
+        run: |
+          set -euo pipefail
+          app_path=$(find target -maxdepth 5 -iname "*.app" -print -quit)
+          if [[ -z "$app_path" ]]; then
+            echo "::error::Could not find a built .app bundle under target/" >&2
+            find target -maxdepth 5 -iname "*.app" || true
+            exit 1
+          fi
+          echo "Found app bundle: $app_path"
+          echo "app_path=$app_path" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke check — run `cli --version` headlessly
+        # This does not require a display/GUI: crates/cli/src/main.rs handles
+        # --version and returns before any window/app-launch code runs.
+        run: |
+          set -euo pipefail
+          cli_bin="${{ steps.locate_app.outputs.app_path }}/Contents/MacOS/cli"
+          if [[ ! -x "$cli_bin" ]]; then
+            echo "::error::cli binary missing or not executable at $cli_bin" >&2
+            exit 1
+          fi
+          version_output=$("$cli_bin" --version)
+          echo "Reported version: $version_output"
+          if [[ -z "$version_output" ]]; then
+            echo "::error::cli --version produced no output" >&2
+            exit 1
+          fi
+
+      - name: Package app bundle
+        id: package_app
+        env:
+          APP_PATH: ${{ steps.locate_app.outputs.app_path }}
+        run: |
+          set -euo pipefail
+          app_zip="$RUNNER_TEMP/zed-dev-${GITHUB_RUN_ID}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$app_zip"
+          test -s "$app_zip"
+          echo "app_zip=$app_zip" >> "$GITHUB_OUTPUT"
+
+      - name: Upload app bundle as build artifact
+        if: always() && steps.package_app.outputs.app_zip != ''
+        uses: actions/upload-artifact@v6
+        with:
+          name: zed-macos-dev-app-${{ github.sha }}
+          path: ${{ steps.package_app.outputs.app_zip }}
+          retention-days: 14
+
+      - name: Locate built DMG
+        id: locate_dmg
+        if: always()
+        run: |
+          dmg_path=$(find target -maxdepth 5 -iname "Zed-*.dmg" -print -quit || true)
+          echo "dmg_path=$dmg_path" >> "$GITHUB_OUTPUT"
+
+      - name: Upload DMG as build artifact
+        if: always() && steps.locate_dmg.outputs.dmg_path != ''
+        uses: actions/upload-artifact@v6
+        with:
+          name: zed-macos-dev-build-${{ github.sha }}
+          path: ${{ steps.locate_dmg.outputs.dmg_path }}
+          retention-days: 14
+
+  build-linux:
+    name: Build Linux tarball (dev channel) + smoke check
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+
+    steps:
+      # A cold-cache release build of the whole workspace needs far more than the
+      # ~14 GB a stock hosted Ubuntu runner leaves free, so drop the preinstalled
+      # toolchains we do not use. This reliably buys ~30 GB.
+      - name: Free up disk space
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/local/.ghcup
+          df -h /
+
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Linux build dependencies
+        run: ./script/linux
+
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Download wasi-sdk
+        run: ./script/download-wasi-sdk
+
+      # script/bundle-linux strips binaries with `llvm-objcopy`, but Ubuntu's llvm
+      # packages only install versioned names (llvm-objcopy-18) on PATH.
+      - name: Ensure llvm-objcopy is on PATH
+        run: |
+          set -euo pipefail
+          if command -v llvm-objcopy >/dev/null 2>&1; then
+            echo "llvm-objcopy already on PATH"
+            exit 0
+          fi
+          shopt -s nullglob
+          candidates=(/usr/bin/llvm-objcopy-*)
+          if [[ ${#candidates[@]} -eq 0 ]]; then
+            echo "::error::No llvm-objcopy found; script/linux should have installed llvm" >&2
+            exit 1
+          fi
+          versioned=$(printf '%s\n' "${candidates[@]}" | sort -V | tail -n1)
+          sudo ln -sf "$versioned" /usr/local/bin/llvm-objcopy
+          llvm-objcopy --version
+
+      - name: Build & bundle Linux tarball (dev build)
+        run: ./script/bundle-linux
+
+      - name: Locate built tarball
+        id: locate_tarball
+        run: |
+          set -euo pipefail
+          tarball=$(find target/release -maxdepth 1 -name "zed-linux-*.tar.gz" -print -quit)
+          if [[ -z "$tarball" ]]; then
+            echo "::error::Could not find a built tarball under target/release/" >&2
+            ls -la target/release || true
+            exit 1
+          fi
+          echo "Found tarball: $tarball"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke check — run `zed --version` headlessly
+        # bin/zed is the `cli` binary; crates/cli/src/main.rs handles --version and
+        # returns before any window/app-launch code runs, so no display is needed.
+        env:
+          TARBALL: ${{ steps.locate_tarball.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          extract_dir=$(mktemp -d)
+          tar -xzf "$TARBALL" -C "$extract_dir"
+          cli_bin=$(find "$extract_dir" -maxdepth 3 -path "*/bin/zed" -print -quit)
+          if [[ ! -x "$cli_bin" ]]; then
+            echo "::error::zed cli binary missing or not executable in $TARBALL" >&2
+            find "$extract_dir" -maxdepth 3 || true
+            exit 1
+          fi
+          version_output=$("$cli_bin" --version)
+          echo "Reported version: $version_output"
+          if [[ -z "$version_output" ]]; then
+            echo "::error::zed --version produced no output" >&2
+            exit 1
+          fi
+
+      - name: Upload Linux tarball as build artifact
+        if: always() && steps.locate_tarball.outputs.tarball != ''
+        uses: actions/upload-artifact@v6
+        with:
+          name: zed-linux-dev-build-${{ github.sha }}
+          path: ${{ steps.locate_tarball.outputs.tarball }}
+          retention-days: 14
+
+      - name: Locate built remote server
+        id: locate_remote_server
+        if: always()
+        run: |
+          remote_server=$(find target -maxdepth 1 -name "zed-remote-server-linux-*.gz" -print -quit || true)
+          echo "remote_server=$remote_server" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Linux remote server as build artifact
+        if: always() && steps.locate_remote_server.outputs.remote_server != ''
+        uses: actions/upload-artifact@v6
+        with:
+          name: zed-remote-server-linux-dev-${{ github.sha }}
+          path: ${{ steps.locate_remote_server.outputs.remote_server }}
+          retention-days: 14
+
+  build-windows:
+    name: Build unsigned Windows installer (dev channel) + smoke check
+    runs-on: windows-2022
+    timeout-minutes: 240
+    env:
+      # script/bundle-windows.ps1 skips code signing when the Azure Trusted Signing
+      # variables below are absent, so nothing here needs to be configured for the
+      # build to succeed — it just produces an unsigned installer.
+      CARGO_INCREMENTAL: 0
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Ensure Inno Setup is installed
+        run: |
+          $paths = @(
+            (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+            (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe")
+          )
+          if ($paths | Where-Object { Test-Path $_ }) {
+            Write-Output "Inno Setup 6 already installed"
+          } elseif (Get-Command "iscc" -ErrorAction SilentlyContinue) {
+            Write-Output "iscc found on PATH"
+          } else {
+            Write-Output "Installing Inno Setup 6 via chocolatey"
+            choco install innosetup --no-progress -y
+          }
+
+      - name: Build & bundle Windows installer (unsigned dev build)
+        run: script/bundle-windows.ps1 -Architecture x86_64
+
+      - name: Smoke check — run `cli.exe --version` headlessly
+        # crates/cli/src/main.rs handles --version and returns before any
+        # window/app-launch code runs, so this needs no interactive session.
+        run: |
+          $cliBin = "target\x86_64-pc-windows-msvc\release\cli.exe"
+          if (-not (Test-Path $cliBin)) {
+            Write-Output "::error::cli.exe missing at $cliBin"
+            exit 1
+          }
+          $versionOutput = & $cliBin --version
+          Write-Output "Reported version: $versionOutput"
+          if ([string]::IsNullOrWhiteSpace($versionOutput)) {
+            Write-Output "::error::cli.exe --version produced no output"
+            exit 1
+          }
+
+      - name: Upload Windows installer as build artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: zed-windows-dev-build-${{ github.sha }}
+          path: target/Zed-x86_64.exe
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload Windows remote server as build artifact
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: zed-remote-server-windows-dev-${{ github.sha }}
+          path: target/zed-remote-server-windows-x86_64.zip
+          retention-days: 14
+          if-no-files-found: warn
+
+  publish-prerelease:
+    name: Publish GitHub prerelease
+    needs:
+      - build-macos
+      - build-linux
+      - build-windows
+    # Publish whatever did build: one platform failing should not throw away the
+    # other two after they each spent hours compiling.
+    if: always() && contains(needs.*.result, 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      - name: Collect release assets
+        id: collect
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          find artifacts -type f -print0 | xargs -0 -I {} cp {} release-assets/
+          ls -la release-assets
+          if [[ -z "$(ls -A release-assets)" ]]; then
+            echo "::error::No build artifacts were produced by any platform" >&2
+            exit 1
+          fi
+
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MACOS_RESULT: ${{ needs.build-macos.result }}
+          LINUX_RESULT: ${{ needs.build-linux.result }}
+          WINDOWS_RESULT: ${{ needs.build-windows.result }}
+        run: |
+          set -euo pipefail
+          notes=$(cat <<EOF
+          Automated dev build.
+
+          Commit: ${GITHUB_SHA}
+          Run: ${GITHUB_RUN_NUMBER} (${GITHUB_RUN_ID})
+
+          | Platform | Result |
+          | --- | --- |
+          | macOS | ${MACOS_RESULT} |
+          | Linux | ${LINUX_RESULT} |
+          | Windows | ${WINDOWS_RESULT} |
+          EOF
+          )
+          gh release create "dev-${GITHUB_RUN_ID}" \
+            release-assets/* \
+            --target "$GITHUB_SHA" \
+            --title "Zed Dev Build ${GITHUB_RUN_NUMBER}" \
+            --prerelease \
+            --notes "$notes"
