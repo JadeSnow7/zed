@@ -13,9 +13,9 @@
 //! left open shows what it last read.
 //!
 //! The queue is different --- everything in it is live worker state, so it
-//! observes the Mission's threads directly and re-renders as they change. It
-//! does not pin them: `WorkerDashboard` is the only thing in this crate that
-//! calls `pin_thread`.
+//! observes the Mission's threads directly and pins them while it is open, so
+//! a worker going idle cannot disappear out from under the user. The
+//! `WorkerDashboard` uses the same lifetime rule for its worker tab.
 
 use chrono::{DateTime, Utc};
 use collections::HashSet;
