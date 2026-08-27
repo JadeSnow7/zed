@@ -425,7 +425,7 @@ impl WorkerDashboard {
                     AgentThreadEntry::UserMessage(message) => Some(message.content.to_markdown(cx)),
                     _ => None,
                 });
-        if latest_user_message.as_deref() == Some(submitted.as_ref()) {
+        if latest_user_message == Some(submitted.as_ref()) {
             self.latest_submitted_instruction = None;
         }
     }
@@ -610,7 +610,7 @@ impl WorkerDashboard {
         };
 
         let send = send_to_worker_view(&target_thread_view, message, window, cx);
-        let note_for_clear = note.clone();
+        let note_for_clear = note;
         cx.spawn_in(window, async move |this, cx| {
             let result = send.await;
             this.update_in(cx, |this, window, cx| match result {
@@ -1498,10 +1498,7 @@ mod tests {
                 editor.set_text("first instruction", window, cx);
             });
             dashboard.send_instruction(window, cx);
-            assert_eq!(
-                dashboard.instruction_editor.read(cx).text(cx).to_string(),
-                ""
-            );
+            assert_eq!(dashboard.instruction_editor.read(cx).text(cx), "");
             assert_eq!(
                 dashboard.feedback.as_deref(),
                 Some("Submitted — waiting for response")
@@ -1532,10 +1529,7 @@ mod tests {
         cx.run_until_parked();
 
         dashboard.read_with(&cx, |dashboard, cx| {
-            assert_eq!(
-                dashboard.instruction_editor.read(cx).text(cx).to_string(),
-                "new draft"
-            );
+            assert_eq!(dashboard.instruction_editor.read(cx).text(cx), "new draft");
         });
     }
 

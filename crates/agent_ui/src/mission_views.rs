@@ -676,7 +676,7 @@ impl EvidenceView {
         let worker = self.worker_for_role(role.as_deref(), cx);
         // Attribution line: the role when we have one (that is the worker the
         // reader is looking for), falling back to whoever recorded the row.
-        let attribution = role.clone().unwrap_or_else(|| author.clone());
+        let attribution = role.unwrap_or_else(|| author.clone());
 
         v_flex()
             .w_full()
