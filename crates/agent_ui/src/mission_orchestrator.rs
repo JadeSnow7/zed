@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use acp_thread::{AcpThread, AgentThreadEntry, ThreadStatus, ToolCallStatus};
@@ -21,12 +22,47 @@ use workspace::{ModalView, Workspace};
 
 use crate::{
     Agent, AgentInitialContent, AgentPanel, AgentThreadSource, CreateThreadOptions,
-    conversation_view::RootThreadUpdated,
     thread_metadata_store::{Mission, MissionId, ThreadId, ThreadMetadataStore},
 };
 
 const SHARED_CONTEXT_SERVER_ID: &str = "shared-context";
-const SHARED_CONTEXT_SERVER_COMMAND: &str = "shared-context-mcp";
+const SHARED_CONTEXT_SERVER_BINARY: &str = "shared-context-mcp";
+
+/// Absolute path to the `shared-context-mcp` binary we ship.
+///
+/// Deliberately not a bare command name. A bare name is resolved against
+/// `PATH` at spawn time, which in a packaged build fails --- the binary lives
+/// inside the bundle, not on `PATH` --- and, worse, succeeds against anything
+/// else on `PATH` that happens to share the name, which Zed would then run with
+/// the user's privileges. Every candidate below is a location the bundle
+/// scripts put the binary in themselves (see `script/bundle-*`).
+fn shared_context_server_path(cx: &App) -> Option<PathBuf> {
+    // macOS bundle: `Contents/MacOS`, beside `zed`, `cli` and `git`. Asking
+    // NSBundle is what `zed::main` does to find the bundled git binary.
+    if cfg!(target_os = "macos") {
+        if let Ok(path) = cx.path_for_auxiliary_executable(SHARED_CONTEXT_SERVER_BINARY) {
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+
+    // Everywhere else, and for `cargo run`: beside the running executable
+    // (Linux installs put both under `libexec/`, dev builds under `target/`),
+    // then `bin/` below it, which is the Windows installer's layout.
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let file_name = format!(
+        "{SHARED_CONTEXT_SERVER_BINARY}{}",
+        std::env::consts::EXE_SUFFIX
+    );
+    [
+        exe_dir.join(&file_name),
+        exe_dir.join("bin").join(&file_name),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.exists())
+}
 
 /// Aggregated state of all threads assigned to a Mission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,11 +180,37 @@ fn thread_state(thread: &AcpThread) -> MissionThreadState {
     }
 }
 
-pub(crate) fn ensure_shared_context_server(settings: &mut ProjectSettingsContent) -> bool {
-    if settings
-        .context_servers
-        .contains_key(SHARED_CONTEXT_SERVER_ID)
+pub(crate) fn ensure_shared_context_server(
+    settings: &mut ProjectSettingsContent,
+    server_path: &Path,
+    db_path: &Path,
+) -> bool {
+    if let Some(ContextServerSettingsContent::Stdio {
+        enabled,
+        remote,
+        command,
+    }) = settings.context_servers.get_mut(SHARED_CONTEXT_SERVER_ID)
     {
+        let legacy_command = *enabled
+            && !*remote
+            && command.args.is_empty()
+            && command.timeout.is_none()
+            && command
+                .env
+                .as_ref()
+                .is_none_or(collections::HashMap::is_empty)
+            && command.path.file_name().is_some_and(|name| {
+                name == SHARED_CONTEXT_SERVER_BINARY
+                    && (command.path.is_relative() || command.path == server_path)
+            });
+        if legacy_command {
+            command.path = server_path.to_path_buf();
+            command.env = Some(collections::HashMap::from_iter([(
+                shared_context::DB_PATH_ENV_VAR.to_string(),
+                db_path.to_string_lossy().into_owned(),
+            )]));
+            return true;
+        }
         return false;
     }
 
@@ -158,9 +220,17 @@ pub(crate) fn ensure_shared_context_server(settings: &mut ProjectSettingsContent
             enabled: true,
             remote: false,
             command: context_server::ContextServerCommand {
-                path: SHARED_CONTEXT_SERVER_COMMAND.into(),
+                path: server_path.to_path_buf(),
                 args: Vec::new(),
-                env: None,
+                // Pin the child to the same database this Zed reads. Without
+                // it, a Zed started with `--user-data-dir` and the MCP servers
+                // it spawns open different files and the two halves of a
+                // Mission stop seeing each other; see
+                // `shared_context::DB_PATH_ENV_VAR`.
+                env: Some(collections::HashMap::from_iter([(
+                    shared_context::DB_PATH_ENV_VAR.to_string(),
+                    db_path.to_string_lossy().into_owned(),
+                )])),
                 timeout: None,
             },
         },
@@ -172,22 +242,45 @@ fn register_shared_context_server(
     fs: Arc<dyn Fs>,
     cx: &mut App,
 ) -> futures::channel::oneshot::Receiver<anyhow::Result<()>> {
-    update_settings_file_with_completion(fs, cx, |settings, _| {
-        ensure_shared_context_server(&mut settings.project);
+    let server_path = shared_context_server_path(cx);
+    let db_path = shared_context::default_db_path();
+    update_settings_file_with_completion(fs, cx, move |settings, _| {
+        let Some(server_path) = server_path.as_deref() else {
+            // A user's existing custom or disabled configuration must remain
+            // usable even when this build does not contain the bundled helper.
+            // A missing entry cannot be made valid without that binary, so
+            // leave the user's settings untouched rather than writing a
+            // command that is guaranteed to fail.
+            if !settings
+                .project
+                .context_servers
+                .contains_key(SHARED_CONTEXT_SERVER_ID)
+            {
+                log::error!(
+                    "could not locate the {SHARED_CONTEXT_SERVER_BINARY} binary beside Zed"
+                );
+            }
+            return;
+        };
+        ensure_shared_context_server(&mut settings.project, server_path, &db_path);
     })
 }
 
 fn mission_prompt(mission: &Mission, role: &str) -> String {
+    // `role` is repeated inside `shared_context` on purpose. The tool schemas
+    // describe the argument, but the value only exists here, and a row recorded
+    // without it cannot be attributed to this worker afterwards --- there is
+    // nothing else on the row to recover it from.
     format!(
         r#"<zed-mission-context>
-mission_id: {}
-title: {}
-role: {}
-shared_context: "Use record_decision, record_artifact, record_evidence, and get_mission_context with this mission_id when sharing information across Harnesses."
+mission_id: {mission_id}
+title: {title}
+role: {role}
+shared_context: "Use record_decision, record_artifact, record_evidence, and get_mission_context with this mission_id when sharing information across Harnesses. Pass role: '{role}' on every record_* call so your work is attributed to you, and an author naming yourself (e.g. 'claude-code')."
 </zed-mission-context>"#,
-        mission.id.to_key_string(),
-        mission.title,
-        role,
+        mission_id = mission.id.to_key_string(),
+        title = mission.title,
+        role = role,
     )
 }
 
@@ -500,27 +593,18 @@ impl MissionOrchestratorModal {
                             window,
                             cx,
                         );
-                        if let Some(view) = panel.conversation_view_for_id(&thread_id, cx).cloned()
-                        {
-                            let role = spec.role.clone();
-                            cx.subscribe(
-                                &view,
-                                move |_panel, _view, _event: &RootThreadUpdated, cx| {
-                                    let role = role.clone();
-                                    cx.defer(move |cx| {
-                                        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                                            store.set_thread_mission(
-                                                thread_id,
-                                                Some(mission.id),
-                                                Some(role),
-                                                cx,
-                                            );
-                                        });
-                                    });
-                                },
-                            )
-                            .detach();
-                        }
+                        // One call, no subscription. `set_thread_mission`
+                        // parks the assignment when the thread's metadata entry
+                        // does not exist yet (the usual case for an external
+                        // Harness, whose connection is still coming up) and the
+                        // store applies it atomically when it creates the row.
+                        //
+                        // This used to also re-assert the assignment on every
+                        // `RootThreadUpdated` from a never-released
+                        // subscription, which papered over the race at the cost
+                        // of silently reverting any later reassignment --- so
+                        // "move this worker to another Mission" could not be
+                        // built on top of it.
                         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                             store.set_thread_mission(
                                 thread_id,
@@ -748,14 +832,134 @@ mod tests {
     #[test]
     fn shared_context_server_is_added_only_when_missing() {
         let mut settings = ProjectSettingsContent::default();
-        assert!(ensure_shared_context_server(&mut settings));
-        assert!(!ensure_shared_context_server(&mut settings));
+        let server_path = std::env::temp_dir().join(SHARED_CONTEXT_SERVER_BINARY);
+        let db_path = std::env::temp_dir().join("zed-shared-context.sqlite");
+        assert!(ensure_shared_context_server(
+            &mut settings,
+            &server_path,
+            &db_path
+        ));
+        assert!(!ensure_shared_context_server(
+            &mut settings,
+            &server_path,
+            &db_path
+        ));
         assert_eq!(settings.context_servers.len(), 1);
+
+        // The two properties that actually matter, and that a bare command
+        // name silently lost: an absolute path (so the bundled binary is what
+        // runs, not whatever `PATH` offers) and an explicit database path (so
+        // the child cannot end up on a different `shared_context.sqlite` than
+        // the Zed that spawned it).
+        let Some(ContextServerSettingsContent::Stdio { command, .. }) =
+            settings.context_servers.get(SHARED_CONTEXT_SERVER_ID)
+        else {
+            panic!("shared context server was not registered as a stdio server");
+        };
         assert!(
-            settings
-                .context_servers
-                .contains_key(SHARED_CONTEXT_SERVER_ID)
+            command.path.is_absolute(),
+            "expected an absolute command path, got {:?}",
+            command.path
         );
+        assert_eq!(command.path, server_path);
+        assert_eq!(
+            command
+                .env
+                .as_ref()
+                .and_then(|env| env.get(shared_context::DB_PATH_ENV_VAR))
+                .map(String::as_str),
+            Some(&*db_path.to_string_lossy()),
+        );
+    }
+
+    #[test]
+    fn legacy_shared_context_server_is_upgraded_but_custom_and_disabled_are_preserved() {
+        let server_path = std::env::temp_dir().join(SHARED_CONTEXT_SERVER_BINARY);
+        let db_path = std::env::temp_dir().join("zed-shared-context.sqlite");
+
+        let mut legacy = ProjectSettingsContent::default();
+        legacy.context_servers.insert(
+            SHARED_CONTEXT_SERVER_ID.into(),
+            ContextServerSettingsContent::Stdio {
+                enabled: true,
+                remote: false,
+                command: context_server::ContextServerCommand {
+                    path: SHARED_CONTEXT_SERVER_BINARY.into(),
+                    args: Vec::new(),
+                    env: None,
+                    timeout: None,
+                },
+            },
+        );
+        assert!(ensure_shared_context_server(
+            &mut legacy,
+            &server_path,
+            &db_path
+        ));
+        let Some(ContextServerSettingsContent::Stdio { command, .. }) =
+            legacy.context_servers.get(SHARED_CONTEXT_SERVER_ID)
+        else {
+            panic!("legacy shared context server should remain stdio");
+        };
+        assert_eq!(command.path, server_path);
+        assert!(command.env.as_ref().is_some_and(|env| {
+            env.get(shared_context::DB_PATH_ENV_VAR)
+                == Some(&db_path.to_string_lossy().into_owned())
+        }));
+
+        let mut disabled = ProjectSettingsContent::default();
+        disabled.context_servers.insert(
+            SHARED_CONTEXT_SERVER_ID.into(),
+            ContextServerSettingsContent::Stdio {
+                enabled: false,
+                remote: false,
+                command: context_server::ContextServerCommand {
+                    path: SHARED_CONTEXT_SERVER_BINARY.into(),
+                    args: Vec::new(),
+                    env: None,
+                    timeout: None,
+                },
+            },
+        );
+        assert!(!ensure_shared_context_server(
+            &mut disabled,
+            &server_path,
+            &db_path
+        ));
+        let Some(ContextServerSettingsContent::Stdio { command, .. }) =
+            disabled.context_servers.get(SHARED_CONTEXT_SERVER_ID)
+        else {
+            panic!("disabled shared context server should remain stdio");
+        };
+        assert_eq!(command.path, Path::new(SHARED_CONTEXT_SERVER_BINARY));
+
+        let custom_path = std::env::temp_dir().join("my-shared-context-mcp");
+        let mut custom = ProjectSettingsContent::default();
+        custom.context_servers.insert(
+            SHARED_CONTEXT_SERVER_ID.into(),
+            ContextServerSettingsContent::Stdio {
+                enabled: true,
+                remote: false,
+                command: context_server::ContextServerCommand {
+                    path: custom_path.clone(),
+                    args: vec!["--custom".into()],
+                    env: None,
+                    timeout: None,
+                },
+            },
+        );
+        assert!(!ensure_shared_context_server(
+            &mut custom,
+            &server_path,
+            &db_path
+        ));
+        let Some(ContextServerSettingsContent::Stdio { command, .. }) =
+            custom.context_servers.get(SHARED_CONTEXT_SERVER_ID)
+        else {
+            panic!("custom shared context server should remain stdio");
+        };
+        assert_eq!(command.path, custom_path);
+        assert_eq!(command.args, vec!["--custom".to_string()]);
     }
 
     #[test]
@@ -770,5 +974,13 @@ mod tests {
         assert!(prompt.contains("title: Ship the feature"));
         assert!(prompt.contains("role: coding"));
         assert!(prompt.contains("get_mission_context"));
+        // The role has to be repeated as an instruction, not just declared:
+        // a row recorded without it cannot be attributed to this worker later.
+        assert!(prompt.contains("Pass role: 'coding'"));
+        assert!(
+            !prompt.contains('\\'),
+            "the prompt is a raw string; a stray backslash means an escape was \
+             written that Rust did not process: {prompt}"
+        );
     }
 }

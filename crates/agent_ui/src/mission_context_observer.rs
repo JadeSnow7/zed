@@ -18,8 +18,6 @@
 //! latter has no thread-level event at all, only `Terminal::wait_for_exit`
 //! on the terminal entity itself. See [`observe_entry`].
 
-use std::path::PathBuf;
-
 use acp_thread::{AcpThread, AgentThreadEntry, ToolCallContent, ToolCallStatus};
 use agent_client_protocol::schema::v1 as acp;
 use collections::HashSet;
@@ -30,17 +28,15 @@ use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore};
 
 /// `author` value used for rows Zed's observer records automatically, as
 /// opposed to a Harness calling `record_artifact`/`record_evidence` itself.
+///
+/// This is now the observer's *only* author value. It used to write the
+/// thread's Mission role here instead, which conflated "who recorded this" with
+/// "whose work is this" --- the role travels in its own column now.
 const OBSERVER_AUTHOR: &str = "zed-observer";
 
 struct GlobalSharedContext(Option<SharedContextStore>);
 
 impl Global for GlobalSharedContext {}
-
-fn shared_context_db_path() -> PathBuf {
-    paths::database_dir()
-        .join("shared_context")
-        .join("shared_context.sqlite")
-}
 
 /// Opens the Shared Context store synchronously, matching the precedent set
 /// by `crates/db`'s own `open_db` (also opened via a blocking `gpui::block_on`
@@ -52,7 +48,7 @@ pub fn init(cx: &mut App) {
     if cx.has_global::<GlobalSharedContext>() {
         return;
     }
-    let db_path = shared_context_db_path();
+    let db_path = shared_context::default_db_path();
     let store = match gpui::block_on(SharedContextStore::open(&db_path)) {
         Ok(store) => Some(store),
         Err(err) => {
@@ -81,25 +77,31 @@ pub(crate) fn set_global_for_test(store: Option<SharedContextStore>, cx: &mut Ap
     cx.set_global(GlobalSharedContext(store));
 }
 
-/// The Mission a thread belongs to, plus the `author` its observed rows should
-/// be attributed to. Rows are attributed to the thread's Mission role when it
-/// has one, so per-worker surfaces can tell whose work a row came from;
-/// [`OBSERVER_AUTHOR`] is the fallback for a thread with no role.
+/// The Mission a thread belongs to and the Mission role of the worker running
+/// in it, if any.
+///
+/// The role is carried separately from the author (always [`OBSERVER_AUTHOR`]
+/// for rows this module writes) so per-worker surfaces have something to filter
+/// on that a Harness's own `record_*` calls can also supply. `None` when the
+/// thread has no role: unattributed is the honest answer, and better than
+/// borrowing the observer's name as a pseudo-role that groups every roleless
+/// thread together.
 fn mission_context_for_thread(
     thread_id: ThreadId,
     cx: &App,
-) -> Option<(shared_context::MissionId, String)> {
+) -> Option<(shared_context::MissionId, Option<String>)> {
     let store = ThreadMetadataStore::try_global(cx)?;
     let metadata = store.read(cx).entry(thread_id)?;
     let mission_id = metadata.mission_id?;
-    let author = metadata
+    let role = metadata
         .role
         .as_ref()
         .map(|role| role.trim())
         .filter(|role| !role.is_empty())
-        .map_or_else(|| OBSERVER_AUTHOR.to_string(), |role| role.to_string());
-    let mission_id = shared_context::MissionId::from_key_string(&mission_id.to_key_string()).ok()?;
-    Some((mission_id, author))
+        .map(|role| role.to_string());
+    let mission_id =
+        shared_context::MissionId::from_key_string(&mission_id.to_key_string()).ok()?;
+    Some((mission_id, role))
 }
 
 fn strip_code_fence(source: &str) -> String {
@@ -132,7 +134,7 @@ pub fn observe_entry(
     index: usize,
     cx: &App,
 ) {
-    let Some((mission_id, author)) = mission_context_for_thread(thread_id, cx) else {
+    let Some((mission_id, role)) = mission_context_for_thread(thread_id, cx) else {
         return;
     };
 
@@ -150,7 +152,7 @@ pub fn observe_entry(
             if !state.recorded_evidence_terminals.insert(terminal_id) {
                 continue;
             }
-            spawn_terminal_evidence_wait(mission_id, author.clone(), terminal.clone(), cx);
+            spawn_terminal_evidence_wait(mission_id, role.clone(), terminal.clone(), cx);
         }
         return;
     }
@@ -192,7 +194,13 @@ pub fn observe_entry(
     cx.background_spawn(async move {
         for path in paths {
             if let Err(err) = store
-                .record_artifact(mission_id, path, change_summary.clone(), author.clone())
+                .record_artifact(
+                    mission_id,
+                    path,
+                    change_summary.clone(),
+                    OBSERVER_AUTHOR.to_string(),
+                    role.clone(),
+                )
                 .await
             {
                 log::error!("mission_context_observer: failed to record artifact: {err:#}");
@@ -204,7 +212,7 @@ pub fn observe_entry(
 
 fn spawn_terminal_evidence_wait(
     mission_id: shared_context::MissionId,
-    author: String,
+    role: Option<String>,
     terminal: Entity<acp_thread::Terminal>,
     cx: &App,
 ) {
@@ -227,7 +235,14 @@ fn spawn_terminal_evidence_wait(
         };
 
         if let Err(err) = store
-            .record_evidence(mission_id, command, result, exit_code, author)
+            .record_evidence(
+                mission_id,
+                command,
+                result,
+                exit_code,
+                OBSERVER_AUTHOR.to_string(),
+                role,
+            )
             .await
         {
             log::error!("mission_context_observer: failed to record evidence: {err:#}");
