@@ -349,6 +349,15 @@ fn main() {
         .with_assets(Assets)
         .with_restart_arguments(restart_arguments);
 
+    if !*zed_env_vars::ZED_STATELESS {
+        let database_path = db::db_path(&db::database_dir(), *release_channel::RELEASE_CHANNEL);
+        if let Err(error) =
+            agent_ui::thread_metadata_store::preflight_legacy_mission_database(&database_path)
+        {
+            log::error!("Refusing to open incompatible metadata database: {error:#}");
+            return;
+        }
+    }
     let app_db = db::AppDatabase::new();
     let system_id = app.background_executor().spawn(system_id());
     let installation_id = app

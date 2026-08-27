@@ -43,7 +43,8 @@ impl Connection {
         Ok(connection)
     }
 
-    pub(crate) fn open(uri: &str, persistent: bool) -> Result<Self> {
+    /// Opens a SQLite connection without falling back to an in-memory database.
+    pub fn open(uri: &str, persistent: bool) -> Result<Self> {
         Self::open_with_flags(
             uri,
             persistent,
