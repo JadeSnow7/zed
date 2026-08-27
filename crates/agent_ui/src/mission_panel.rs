@@ -1027,9 +1027,11 @@ impl MissionPanel {
             .flex_none()
             .items_center()
             .gap_1p5()
-            .map(|header| match window.window_decorations() {
-                Decorations::Client { .. } => header.mt(px(-1.)),
-                Decorations::Server => header.mt_px().pb_px(),
+            .when(self.host == MissionPanelHost::Sidebar, |header| {
+                header.map(|header| match window.window_decorations() {
+                    Decorations::Client { .. } => header.mt(px(-1.)),
+                    Decorations::Server => header.mt_px().pb_px(),
+                })
             })
             .when(sidebar_traffic_lights, |this| {
                 this.pl(px(ui::utils::TRAFFIC_LIGHT_PADDING))
