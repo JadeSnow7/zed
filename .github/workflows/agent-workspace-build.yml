@@ -79,6 +79,29 @@ jobs:
           echo "Found app bundle: $app_path"
           echo "app_path=$app_path" >> "$GITHUB_OUTPUT"
 
+      - name: Assert bundled `shared-context-mcp` exists and speaks MCP
+        env:
+          APP_PATH: ${{ steps.locate_app.outputs.app_path }}
+        run: |
+          set -euo pipefail
+          mcp_bin="$APP_PATH/Contents/MacOS/shared-context-mcp"
+          if [[ ! -x "$mcp_bin" ]]; then
+            echo "::error::shared-context-mcp missing or not executable at $mcp_bin" >&2
+            ls -la "$APP_PATH/Contents/MacOS" || true
+            exit 1
+          fi
+          request='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci-smoke","version":"0"}}}'
+          response=$(
+            printf '%s\n' "$request" \
+              | ZED_SHARED_CONTEXT_DB_PATH="$RUNNER_TEMP/smoke-shared-context.sqlite" "$mcp_bin" \
+              | head -n 1
+          )
+          echo "Reported: $response"
+          if [[ "$response" != *'"shared-context-mcp"'* ]]; then
+            echo "::error::shared-context-mcp did not answer initialize" >&2
+            exit 1
+          fi
+
       - name: Smoke check — run `cli --version` headlessly
         # This does not require a display/GUI: crates/cli/src/main.rs handles
         # --version and returns before any window/app-launch code runs.
@@ -356,7 +379,7 @@ jobs:
 
     steps:
       - name: Download all build artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: artifacts
 
