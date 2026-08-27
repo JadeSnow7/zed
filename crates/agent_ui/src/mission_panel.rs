@@ -20,14 +20,20 @@
 //! who want it beside the thread list. The two are separate instances of the
 //! same type, so they cannot disagree about what a Mission looks like.
 //!
-//! Refresh is pull-based for everything persisted: the Mission list and the
-//! Shared Context trail reload when the panel becomes active or when the
-//! selected Mission changes, since neither `ThreadMetadataStore` nor
-//! `shared_context` publish change events and both change at the pace of
-//! Mission/thread creation. The exception is the selected Mission's live
-//! worker threads, which the panel observes directly -- "this worker is
-//! blocked on a permission" is useless if it only shows up at the next
-//! refresh.
+//! Three different refresh paths, because the three sources differ:
+//!
+//! - `ThreadMetadataStore` is a GPUI entity and *is* observed, so a worker
+//!   created elsewhere appears without the user touching anything. It notifies
+//!   on every new entry in every thread, though, which is far more often than
+//!   the Mission list actually changes --- so the dock instance gates its
+//!   observation on being visible (it refreshes on activation anyway) while the
+//!   sidebar instance, which has no activation hook, cannot.
+//! - `shared_context` publishes no change events at all, so the Decision and
+//!   Evidence trail is pulled: on activation, and when the selected Mission
+//!   changes.
+//! - The selected Mission's live worker threads are observed directly. "This
+//!   worker is blocked on a permission" is useless if it only shows up at the
+//!   next refresh.
 
 use acp_thread::AcpThread;
 use chrono::{DateTime, Utc};
@@ -52,6 +58,7 @@ use workspace::{
 
 use crate::{
     Agent, AgentPanel, AgentThreadSource, CreateMission, MissionState, MissionThreadState,
+    conversation_view::ThreadView,
     mission_context_observer::shared_context_store,
     mission_state,
     mission_views::{EvidenceView, MissionQueueView, SharedContextView},
@@ -410,6 +417,21 @@ pub struct MissionPanel {
     /// the attention counts track generation rather than waiting for the next
     /// pull-based refresh. Rebuilt whenever the selected Mission changes.
     _worker_subscriptions: Vec<Subscription>,
+    /// Whether [`Self::_metadata_observation`] should do nothing while the
+    /// panel is hidden.
+    ///
+    /// True for the dock panel, which has a `set_active` hook and refreshes on
+    /// the way back in, so work done while it is closed costs nothing to skip.
+    /// False for the sidebar view, which has no such hook: gating it would mean
+    /// never refreshing at all.
+    ///
+    /// This gate matters more than it looks. `ThreadMetadataStore` is written
+    /// on *every* new entry in *every* thread, and each notification here costs
+    /// a mission list query, a full tree rebuild, and --- when the selection
+    /// changes --- three more Shared Context queries, once per live panel
+    /// instance. A hidden panel paying that for a thread the user cannot see is
+    /// pure waste.
+    refreshes_only_while_active: bool,
     /// The dock panel refreshes when it becomes active; the sidebar view has
     /// no such hook, so both watch `ThreadMetadataStore` instead. Missions and
     /// workers are created through it, so a new worker shows up without the
@@ -417,13 +439,17 @@ pub struct MissionPanel {
     _metadata_observation: Option<Subscription>,
 }
 
-/// Re-reads the Mission list whenever `ThreadMetadataStore` changes.
+/// Re-reads the Mission list whenever `ThreadMetadataStore` changes, unless
+/// this panel is hidden and refreshes on activation anyway.
 fn observe_metadata_store(
     window: &mut Window,
     cx: &mut Context<MissionPanel>,
 ) -> Option<Subscription> {
     let store = ThreadMetadataStore::try_global(cx)?;
     Some(cx.observe_in(&store, window, |this, _, window, cx| {
+        if this.refreshes_only_while_active && !this.is_active {
+            return;
+        }
         this.refresh(window, cx);
     }))
 }
@@ -448,6 +474,9 @@ impl MissionPanel {
             new_task_editor,
             new_task_open: false,
             _worker_subscriptions: Vec::new(),
+            // `set_active` refreshes on the way in, so nothing is lost by
+            // staying quiet while closed.
+            refreshes_only_while_active: true,
             _metadata_observation: observe_metadata_store(window, cx),
         }
     }
@@ -478,6 +507,9 @@ impl MissionPanel {
             new_task_editor,
             new_task_open: false,
             _worker_subscriptions: Vec::new(),
+            // No `set_active` hook here --- the observation is the only way
+            // this view ever learns about a new worker.
+            refreshes_only_while_active: false,
             _metadata_observation: observe_metadata_store(window, cx),
         };
         this.refresh(window, cx);
@@ -1368,7 +1400,10 @@ impl MissionPanel {
                     .child(
                         Label::new(format!(
                             "{} · {}",
-                            decision.author,
+                            // The role names the worker; `author` only names
+                            // whatever recorded the row. Prefer the former when
+                            // it is there. See `shared_context::Decision::role`.
+                            decision.role.as_deref().unwrap_or(&decision.author),
                             relative_time(decision.created_at)
                         ))
                         .size(LabelSize::XSmall)
@@ -1609,6 +1644,30 @@ pub fn send_to_worker(thread: &Entity<AcpThread>, message: String, cx: &mut App)
         send.await.log_err();
     })
     .detach();
+}
+
+/// Sends a Worker Dashboard instruction without interrupting a turn already in
+/// progress. Idle threads take the direct path; generating threads use the
+/// same FIFO queue as the main agent composer.
+pub fn send_to_worker_view(
+    thread_view: &Entity<ThreadView>,
+    message: String,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<anyhow::Result<()>> {
+    let is_idle = thread_view.read(cx).thread.read(cx).status() == acp_thread::ThreadStatus::Idle;
+    if is_idle {
+        let send = thread_view.update(cx, |view, cx| {
+            view.thread
+                .update(cx, |thread, cx| thread.send(vec![message.into()], cx))
+        });
+        cx.background_spawn(async move { send.await.map(|_| ()) })
+    } else {
+        thread_view.update(cx, |view, cx| {
+            view.add_to_queue(vec![message.into()], Vec::new(), window, cx);
+        });
+        Task::ready(Ok(()))
+    }
 }
 
 /// How a worker is named across the sidebar and its dashboard tab: its
@@ -1855,7 +1914,7 @@ impl Panel for MissionPanel {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::test_support;
     use crate::thread_metadata_store::WorktreePaths;
@@ -2100,7 +2159,7 @@ mod tests {
         ));
     }
 
-    async fn setup_workspace_with_two_threads(
+    pub(crate) async fn setup_workspace_with_two_threads(
         cx: &mut TestAppContext,
     ) -> (
         Entity<Workspace>,
@@ -2168,7 +2227,7 @@ mod tests {
 
     /// Puts both threads under one Mission and hands back a panel that has
     /// already loaded it, which is the state every render test below needs.
-    async fn setup_mission_panel(
+    pub(crate) async fn setup_mission_panel(
         cx: &mut TestAppContext,
     ) -> (
         Entity<Workspace>,

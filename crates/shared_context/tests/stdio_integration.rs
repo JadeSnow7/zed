@@ -17,9 +17,16 @@ struct McpProcess {
 }
 
 impl McpProcess {
+    // This test's whole point is to exercise the real binary over real pipes,
+    // which needs the stdio configuration `smol::process::Command::from()`
+    // drops. Blocking here is fine and in fact wanted: the test drives the
+    // server one request at a time and asserts on each response, so there is no
+    // executor to starve. Same exemption `crates/project`'s integration tests
+    // take for spawning helper processes.
+    #[allow(clippy::disallowed_methods)]
     fn spawn(db_path: &std::path::Path) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_shared-context-mcp"))
-            .env("ZED_SHARED_CONTEXT_DB_PATH", db_path)
+            .env(shared_context::DB_PATH_ENV_VAR, db_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -53,7 +60,10 @@ impl McpProcess {
     }
 
     fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
-        self.request("tools/call", json!({ "name": name, "arguments": arguments }))
+        self.request(
+            "tools/call",
+            json!({ "name": name, "arguments": arguments }),
+        )
     }
 }
 
@@ -77,7 +87,10 @@ fn initialize_then_list_tools() {
             "clientInfo": { "name": "stdio-integration-test", "version": "0.0.0" }
         }),
     );
-    assert_eq!(initialize["result"]["serverInfo"]["name"], "shared-context-mcp");
+    assert_eq!(
+        initialize["result"]["serverInfo"]["name"],
+        "shared-context-mcp"
+    );
 
     let list = proc.request("tools/list", json!({}));
     let tool_names: Vec<&str> = list["result"]["tools"]
@@ -110,6 +123,7 @@ fn record_decision_then_read_it_back_via_get_mission_context() {
             "key": "auth-strategy",
             "value": "use OAuth device flow",
             "author": "claude-code",
+            "role": "coding",
         }),
     );
     assert_ne!(record["result"]["isError"], json!(true));
@@ -123,6 +137,9 @@ fn record_decision_then_read_it_back_via_get_mission_context() {
     assert_eq!(context["decisions"][0]["key"], "auth-strategy");
     assert_eq!(context["decisions"][0]["value"], "use OAuth device flow");
     assert_eq!(context["decisions"][0]["author"], "claude-code");
+    // `role` has to survive the round trip separately from `author`: it is what
+    // puts a Harness's own record on that Harness's worker page.
+    assert_eq!(context["decisions"][0]["role"], "coding");
 }
 
 #[test]

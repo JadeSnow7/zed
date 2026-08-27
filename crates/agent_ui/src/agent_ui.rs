@@ -343,6 +343,8 @@ actions!(
         NewTerminalThread,
         /// Creates a Mission and starts the selected Harness threads.
         CreateMission,
+        /// Sends the focused Worker Dashboard instruction.
+        SendWorkerInstruction,
     ]
 );
 

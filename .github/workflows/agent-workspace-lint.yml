@@ -1,0 +1,56 @@
+# Lint gate for the fork's own crates.
+#
+# Zed's generated lint workflows (run_tests.yml et al.) are gated to
+# `github.repository_owner == 'zed-industries'` and pinned to its private runner
+# fleet, so nothing in this fork ever ran clippy. That is how four
+# `disallowed_methods` errors sat in crates/shared_context/tests unnoticed: the
+# only workflow here builds a bundle, and a bundle build does not lint.
+#
+# Deliberately scoped to the crates this fork actually changes rather than
+# `--workspace`. A full-workspace clippy on a 3-vCPU hosted runner is an
+# hour-plus job and would get skipped or disabled; a ten-minute one gets kept.
+# `-p agent_ui` pulls in most of what matters transitively anyway.
+name: agent-workspace-lint
+
+on:
+  push:
+    branches:
+      - "feature/**"
+  pull_request:
+    branches:
+      - "feature/**"
+  workflow_dispatch: {}
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clippy:
+    name: clippy (shared_context, agent_ui)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install pinned Rust toolchain (from rust-toolchain.toml)
+        run: rustup show
+
+      - name: Cache cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install Linux build dependencies
+        run: script/linux
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # script/clippy appends `--release --all-targets --all-features` and
+      # `--deny warnings`. `--all-targets` is the point: the errors this gate
+      # exists for were in a test target, which a plain `cargo clippy` skips.
+      - name: Clippy
+        run: script/clippy -p shared_context -p agent_ui

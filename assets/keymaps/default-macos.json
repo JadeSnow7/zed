@@ -422,6 +422,24 @@
     },
   },
   {
+    "context": "WorkerInstructionEditor > Editor && !use_modifier_to_send",
+    "use_key_equivalents": true,
+    "bindings": {
+      "enter": "agent::SendWorkerInstruction",
+      "cmd-enter": "agent::SendWorkerInstruction",
+      "shift-enter": "editor::Newline",
+    },
+  },
+  {
+    "context": "WorkerInstructionEditor > Editor && use_modifier_to_send",
+    "use_key_equivalents": true,
+    "bindings": {
+      "enter": "editor::Newline",
+      "cmd-enter": "agent::SendWorkerInstruction",
+      "shift-enter": "editor::Newline",
+    },
+  },
+  {
     "context": "ThreadHistory",
     "bindings": {
       "ctrl--": "pane::GoBack",

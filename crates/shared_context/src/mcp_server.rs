@@ -62,7 +62,8 @@ fn tool_definitions() -> Value {
                     "mission_id": { "type": "string", "description": "The Mission id this decision belongs to." },
                     "key": { "type": "string", "description": "Short label for the decision, e.g. \"auth-strategy\"." },
                     "value": { "type": "string", "description": "The decision text, verbatim." },
-                    "author": { "type": "string", "description": "Readable identifier for the Harness/agent recording this, e.g. \"claude-code\"." }
+                    "author": { "type": "string", "description": "Readable identifier for the Harness/agent recording this, e.g. \"claude-code\"." },
+                    "role": { "type": "string", "description": "Copy the `role` value from the <zed-mission-context> block you were given, verbatim. Zed groups rows by role to show each worker its own trail; omit this and what you record will not appear on your worker page." }
                 },
                 "required": ["mission_id", "key", "value"]
             }
@@ -82,7 +83,8 @@ fn tool_definitions() -> Value {
                     "mission_id": { "type": "string", "description": "The Mission id this artifact belongs to." },
                     "path": { "type": "string", "description": "Path of the file that changed." },
                     "change_summary": { "type": "string", "description": "One-line summary of what changed." },
-                    "author": { "type": "string", "description": "Readable identifier for the Harness/agent recording this." }
+                    "author": { "type": "string", "description": "Readable identifier for the Harness/agent recording this." },
+                    "role": { "type": "string", "description": "Copy the `role` value from the <zed-mission-context> block you were given, verbatim. Zed groups rows by role to show each worker its own trail; omit this and what you record will not appear on your worker page." }
                 },
                 "required": ["mission_id", "path", "change_summary"]
             }
@@ -101,7 +103,8 @@ fn tool_definitions() -> Value {
                     "command": { "type": "string", "description": "The command that was run." },
                     "result": { "type": "string", "description": "Its output, or a summary of it." },
                     "exit_code": { "type": "integer", "description": "Its exit code, if known." },
-                    "author": { "type": "string", "description": "Readable identifier for the Harness/agent recording this." }
+                    "author": { "type": "string", "description": "Readable identifier for the Harness/agent recording this." },
+                    "role": { "type": "string", "description": "Copy the `role` value from the <zed-mission-context> block you were given, verbatim. Zed groups rows by role to show each worker its own trail; omit this and what you record will not appear on your worker page." }
                 },
                 "required": ["mission_id", "command", "result"]
             }
@@ -139,6 +142,20 @@ fn optional_str(args: &Value, key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+/// The caller's Mission role, if it passed one.
+///
+/// Absent rather than defaulted: a row with no role is honestly unattributed,
+/// whereas a placeholder would silently group every Harness that forgot the
+/// argument under one imaginary worker. `author` can default to `"unknown"`
+/// because nothing filters on it.
+fn optional_role(args: &Value) -> Option<String> {
+    args.get("role")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+        .map(str::to_string)
+}
+
 fn parse_mission_id(args: &Value) -> Result<MissionId> {
     MissionId::from_key_string(&required_str(args, "mission_id")?)
 }
@@ -148,10 +165,13 @@ async fn call_record_decision(store: &SharedContextStore, args: &Value) -> Resul
     let key = required_str(args, "key")?;
     let value = required_str(args, "value")?;
     let author = optional_str(args, "author", "unknown");
+    let role = optional_role(args);
     store
-        .record_decision(mission_id, key.clone(), value, author)
+        .record_decision(mission_id, key.clone(), value, author, role)
         .await?;
-    Ok(format!("Recorded decision `{key}` for mission {mission_id}."))
+    Ok(format!(
+        "Recorded decision `{key}` for mission {mission_id}."
+    ))
 }
 
 async fn call_record_artifact(store: &SharedContextStore, args: &Value) -> Result<String> {
@@ -159,8 +179,9 @@ async fn call_record_artifact(store: &SharedContextStore, args: &Value) -> Resul
     let path = required_str(args, "path")?;
     let change_summary = required_str(args, "change_summary")?;
     let author = optional_str(args, "author", "unknown");
+    let role = optional_role(args);
     store
-        .record_artifact(mission_id, path.clone(), change_summary, author)
+        .record_artifact(mission_id, path.clone(), change_summary, author, role)
         .await?;
     Ok(format!(
         "Recorded artifact change to `{path}` for mission {mission_id}."
@@ -176,8 +197,9 @@ async fn call_record_evidence(store: &SharedContextStore, args: &Value) -> Resul
         .and_then(Value::as_i64)
         .map(|code| code as i32);
     let author = optional_str(args, "author", "unknown");
+    let role = optional_role(args);
     store
-        .record_evidence(mission_id, command.clone(), result, exit_code, author)
+        .record_evidence(mission_id, command.clone(), result, exit_code, author, role)
         .await?;
     Ok(format!(
         "Recorded evidence for `{command}` for mission {mission_id}."
@@ -207,7 +229,10 @@ async fn handle_tool_call(
         .get("name")
         .and_then(Value::as_str)
         .ok_or((INVALID_PARAMS, "missing tool name".to_string()))?;
-    let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
 
     let call_result = match name {
         "record_decision" => call_record_decision(store, &arguments).await,

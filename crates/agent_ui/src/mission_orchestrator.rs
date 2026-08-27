@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use acp_thread::{AcpThread, AgentThreadEntry, ThreadStatus, ToolCallStatus};
@@ -20,12 +21,47 @@ use workspace::{ModalView, Workspace};
 
 use crate::{
     Agent, AgentInitialContent, AgentPanel, AgentThreadSource, CreateThreadOptions,
-    conversation_view::RootThreadUpdated,
     thread_metadata_store::{Mission, MissionId, ThreadId, ThreadMetadataStore},
 };
 
 const SHARED_CONTEXT_SERVER_ID: &str = "shared-context";
-const SHARED_CONTEXT_SERVER_COMMAND: &str = "shared-context-mcp";
+const SHARED_CONTEXT_SERVER_BINARY: &str = "shared-context-mcp";
+
+/// Absolute path to the `shared-context-mcp` binary we ship.
+///
+/// Deliberately not a bare command name. A bare name is resolved against
+/// `PATH` at spawn time, which in a packaged build fails --- the binary lives
+/// inside the bundle, not on `PATH` --- and, worse, succeeds against anything
+/// else on `PATH` that happens to share the name, which Zed would then run with
+/// the user's privileges. Every candidate below is a location the bundle
+/// scripts put the binary in themselves (see `script/bundle-*`).
+fn shared_context_server_path(cx: &App) -> Option<PathBuf> {
+    // macOS bundle: `Contents/MacOS`, beside `zed`, `cli` and `git`. Asking
+    // NSBundle is what `zed::main` does to find the bundled git binary.
+    if cfg!(target_os = "macos") {
+        if let Ok(path) = cx.path_for_auxiliary_executable(SHARED_CONTEXT_SERVER_BINARY) {
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+
+    // Everywhere else, and for `cargo run`: beside the running executable
+    // (Linux installs put both under `libexec/`, dev builds under `target/`),
+    // then `bin/` below it, which is the Windows installer's layout.
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let file_name = format!(
+        "{SHARED_CONTEXT_SERVER_BINARY}{}",
+        std::env::consts::EXE_SUFFIX
+    );
+    [
+        exe_dir.join(&file_name),
+        exe_dir.join("bin").join(&file_name),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.exists())
+}
 
 /// Aggregated state of all threads assigned to a Mission.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,7 +168,11 @@ fn thread_state(thread: &AcpThread) -> MissionThreadState {
     }
 }
 
-pub(crate) fn ensure_shared_context_server(settings: &mut ProjectSettingsContent) -> bool {
+pub(crate) fn ensure_shared_context_server(
+    settings: &mut ProjectSettingsContent,
+    server_path: &Path,
+    db_path: &Path,
+) -> bool {
     if settings
         .context_servers
         .contains_key(SHARED_CONTEXT_SERVER_ID)
@@ -146,9 +186,17 @@ pub(crate) fn ensure_shared_context_server(settings: &mut ProjectSettingsContent
             enabled: true,
             remote: false,
             command: context_server::ContextServerCommand {
-                path: SHARED_CONTEXT_SERVER_COMMAND.into(),
+                path: server_path.to_path_buf(),
                 args: Vec::new(),
-                env: None,
+                // Pin the child to the same database this Zed reads. Without
+                // it, a Zed started with `--user-data-dir` and the MCP servers
+                // it spawns open different files and the two halves of a
+                // Mission stop seeing each other; see
+                // `shared_context::DB_PATH_ENV_VAR`.
+                env: Some(collections::HashMap::from_iter([(
+                    shared_context::DB_PATH_ENV_VAR.to_string(),
+                    db_path.to_string_lossy().into_owned(),
+                )])),
                 timeout: None,
             },
         },
@@ -160,22 +208,41 @@ fn register_shared_context_server(
     fs: Arc<dyn Fs>,
     cx: &mut App,
 ) -> futures::channel::oneshot::Receiver<anyhow::Result<()>> {
-    update_settings_file_with_completion(fs, cx, |settings, _| {
-        ensure_shared_context_server(&mut settings.project);
+    let Some(server_path) = shared_context_server_path(cx) else {
+        // Registering a server we cannot locate would write a command that
+        // fails at spawn time, in every project, forever. Fail the Mission
+        // creation loudly instead --- this is the failure the user needs to
+        // hear about, because everything else about the Mission still works
+        // and the missing piece is invisible.
+        let (tx, rx) = futures::channel::oneshot::channel();
+        tx.send(Err(anyhow::anyhow!(
+            "could not locate the {SHARED_CONTEXT_SERVER_BINARY} binary beside Zed; \
+             cross-Harness Shared Context is unavailable in this build"
+        )))
+        .ok();
+        return rx;
+    };
+    let db_path = shared_context::default_db_path();
+    update_settings_file_with_completion(fs, cx, move |settings, _| {
+        ensure_shared_context_server(&mut settings.project, &server_path, &db_path);
     })
 }
 
 fn mission_prompt(mission: &Mission, role: &str) -> String {
+    // `role` is repeated inside `shared_context` on purpose. The tool schemas
+    // describe the argument, but the value only exists here, and a row recorded
+    // without it cannot be attributed to this worker afterwards --- there is
+    // nothing else on the row to recover it from.
     format!(
         r#"<zed-mission-context>
-mission_id: {}
-title: {}
-role: {}
-shared_context: "Use record_decision, record_artifact, record_evidence, and get_mission_context with this mission_id when sharing information across Harnesses."
+mission_id: {mission_id}
+title: {title}
+role: {role}
+shared_context: "Use record_decision, record_artifact, record_evidence, and get_mission_context with this mission_id when sharing information across Harnesses. Pass role: '{role}' on every record_* call so your work is attributed to you, and an author naming yourself (e.g. 'claude-code')."
 </zed-mission-context>"#,
-        mission.id.to_key_string(),
-        mission.title,
-        role,
+        mission_id = mission.id.to_key_string(),
+        title = mission.title,
+        role = role,
     )
 }
 
@@ -435,27 +502,18 @@ impl MissionOrchestratorModal {
                             window,
                             cx,
                         );
-                        if let Some(view) = panel.conversation_view_for_id(&thread_id, cx).cloned()
-                        {
-                            let role = spec.role.clone();
-                            cx.subscribe(
-                                &view,
-                                move |_panel, _view, _event: &RootThreadUpdated, cx| {
-                                    let role = role.clone();
-                                    cx.defer(move |cx| {
-                                        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
-                                            store.set_thread_mission(
-                                                thread_id,
-                                                Some(mission.id),
-                                                Some(role),
-                                                cx,
-                                            );
-                                        });
-                                    });
-                                },
-                            )
-                            .detach();
-                        }
+                        // One call, no subscription. `set_thread_mission`
+                        // parks the assignment when the thread's metadata entry
+                        // does not exist yet (the usual case for an external
+                        // Harness, whose connection is still coming up) and the
+                        // store applies it atomically when it creates the row.
+                        //
+                        // This used to also re-assert the assignment on every
+                        // `RootThreadUpdated` from a never-released
+                        // subscription, which papered over the race at the cost
+                        // of silently reverting any later reassignment --- so
+                        // "move this worker to another Mission" could not be
+                        // built on top of it.
                         ThreadMetadataStore::global(cx).update(cx, |store, cx| {
                             store.set_thread_mission(
                                 thread_id,
@@ -683,13 +741,43 @@ mod tests {
     #[test]
     fn shared_context_server_is_added_only_when_missing() {
         let mut settings = ProjectSettingsContent::default();
-        assert!(ensure_shared_context_server(&mut settings));
-        assert!(!ensure_shared_context_server(&mut settings));
+        let server_path = Path::new("/Applications/Zed.app/Contents/MacOS/shared-context-mcp");
+        let db_path = Path::new("/tmp/zed/shared_context/shared_context.sqlite");
+        assert!(ensure_shared_context_server(
+            &mut settings,
+            server_path,
+            db_path
+        ));
+        assert!(!ensure_shared_context_server(
+            &mut settings,
+            server_path,
+            db_path
+        ));
         assert_eq!(settings.context_servers.len(), 1);
+
+        // The two properties that actually matter, and that a bare command
+        // name silently lost: an absolute path (so the bundled binary is what
+        // runs, not whatever `PATH` offers) and an explicit database path (so
+        // the child cannot end up on a different `shared_context.sqlite` than
+        // the Zed that spawned it).
+        let Some(ContextServerSettingsContent::Stdio { command, .. }) =
+            settings.context_servers.get(SHARED_CONTEXT_SERVER_ID)
+        else {
+            panic!("shared context server was not registered as a stdio server");
+        };
         assert!(
-            settings
-                .context_servers
-                .contains_key(SHARED_CONTEXT_SERVER_ID)
+            command.path.is_absolute(),
+            "expected an absolute command path, got {:?}",
+            command.path
+        );
+        assert_eq!(command.path, server_path);
+        assert_eq!(
+            command
+                .env
+                .as_ref()
+                .and_then(|env| env.get(shared_context::DB_PATH_ENV_VAR))
+                .map(String::as_str),
+            Some(&*db_path.to_string_lossy()),
         );
     }
 
@@ -705,5 +793,13 @@ mod tests {
         assert!(prompt.contains("title: Ship the feature"));
         assert!(prompt.contains("role: coding"));
         assert!(prompt.contains("get_mission_context"));
+        // The role has to be repeated as an instruction, not just declared:
+        // a row recorded without it cannot be attributed to this worker later.
+        assert!(prompt.contains("Pass role: 'coding'"));
+        assert!(
+            !prompt.contains('\\'),
+            "the prompt is a raw string; a stray backslash means an escape was \
+             written that Rust did not process: {prompt}"
+        );
     }
 }

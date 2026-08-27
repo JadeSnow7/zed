@@ -8,10 +8,14 @@
 //!
 //! Shared Context and Evidence read the persisted `shared_context` store
 //! pull-based, matching how `mission_panel` treats it: the store publishes no
-//! change events, so each tab loads when it opens and reloads on request. The
-//! queue is different --- everything in it is live worker state, so it observes
-//! the Mission's threads directly and pins them so a worker going idle can't
-//! empty the queue out from under the user.
+//! change events, so each tab loads when it opens and reloads when the user
+//! asks, via the refresh control in its header. There is no push path; a tab
+//! left open shows what it last read.
+//!
+//! The queue is different --- everything in it is live worker state, so it
+//! observes the Mission's threads directly and re-renders as they change. It
+//! does not pin them: `WorkerDashboard` is the only thing in this crate that
+//! calls `pin_thread`.
 
 use chrono::{DateTime, Utc};
 use gpui::{
@@ -241,6 +245,7 @@ impl Render for SharedContextView {
                         matches(&decision.value)
                             || matches(&decision.key)
                             || matches(&decision.author)
+                            || decision.role.as_deref().is_some_and(|role| matches(role))
                     })
                     .map(|decision| {
                         Self::render_row(
@@ -264,6 +269,7 @@ impl Render for SharedContextView {
                         matches(&artifact.path)
                             || matches(&artifact.change_summary)
                             || matches(&artifact.author)
+                            || artifact.role.as_deref().is_some_and(|role| matches(role))
                     })
                     .map(|artifact| {
                         Self::render_row(
@@ -284,7 +290,11 @@ impl Render for SharedContextView {
                     .evidence
                     .iter()
                     .rev()
-                    .filter(|row| matches(&row.command) || matches(&row.author))
+                    .filter(|row| {
+                        matches(&row.command)
+                            || matches(&row.author)
+                            || row.role.as_deref().is_some_and(|role| matches(role))
+                    })
                     .map(|row| {
                         let stale = evidence_is_stale(row.created_at, newest_artifact);
                         Self::render_row(
@@ -376,6 +386,23 @@ impl Render for SharedContextView {
                                 ))
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
+                            )
+                            .child(div().flex_1())
+                            // These tabs read the store pull-based, and the
+                            // store publishes no change events, so an open tab
+                            // shows whatever was there when it opened. Workers
+                            // keep recording after that. Without this control
+                            // there is no way to see the new rows at all short
+                            // of closing and reopening the tab.
+                            .child(
+                                IconButton::new("shared-context-refresh", IconName::RotateCw)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Reload shared context"))
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.context_state = MissionContextState::Loading;
+                                        cx.notify();
+                                        refresh_mission_context(this.mission.id, cx);
+                                    })),
                             ),
                     )
                     .child(
@@ -489,15 +516,20 @@ impl EvidenceView {
         }
     }
 
-    /// The worker whose role matches an Evidence row's author, so "Open
-    /// session" lands on the worker that actually ran the command. The
-    /// observer attributes rows to the thread's Mission role (see
-    /// `mission_context_observer`), which is what makes this lookup work.
-    fn worker_for_author(&self, author: &str, cx: &App) -> Option<ThreadMetadata> {
+    /// The worker an Evidence row belongs to, so "Open session" lands on the
+    /// one that actually ran the command.
+    ///
+    /// Matches on the row's `role`, not its `author`: `author` is who recorded
+    /// the row (`zed-observer`, or a Harness's self-reported name), which is a
+    /// different question and does not name a worker. Rows with no role --- one
+    /// from a Harness that omitted it, or from a thread with no Mission role
+    /// --- have no worker to open, which is the honest answer.
+    fn worker_for_role(&self, role: Option<&str>, cx: &App) -> Option<ThreadMetadata> {
+        let role = role?;
         mission_snapshot(&self.mission, &self.workspace, cx)
             .workers
             .into_iter()
-            .find(|worker| worker.label.as_ref() == author)
+            .find(|worker| worker.label.as_ref() == role)
             .map(|worker| worker.metadata)
     }
 }
@@ -536,6 +568,7 @@ impl Render for EvidenceView {
                         row.command.clone(),
                         row.result.clone(),
                         row.author.clone(),
+                        row.role.clone(),
                         row.exit_code,
                         row.created_at,
                         stale,
@@ -597,6 +630,16 @@ impl Render for EvidenceView {
                         Label::new(format!("{passing} passing · {stale_count} stale"))
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
+                    )
+                    .child(
+                        IconButton::new("evidence-refresh", IconName::RotateCw)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Reload evidence"))
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.context_state = MissionContextState::Loading;
+                                cx.notify();
+                                refresh_mission_context(this.mission.id, cx);
+                            })),
                     ),
             )
             .child(
@@ -619,6 +662,7 @@ impl EvidenceView {
         command: String,
         result: String,
         author: String,
+        role: Option<String>,
         exit_code: Option<i32>,
         created_at: DateTime<Utc>,
         stale: bool,
@@ -629,7 +673,10 @@ impl EvidenceView {
             Some(code) => format!("exit {code}"),
             None => "no exit code".to_string(),
         };
-        let worker = self.worker_for_author(&author, cx);
+        let worker = self.worker_for_role(role.as_deref(), cx);
+        // Attribution line: the role when we have one (that is the worker the
+        // reader is looking for), falling back to whoever recorded the row.
+        let attribution = role.clone().unwrap_or_else(|| author.clone());
 
         v_flex()
             .w_full()
@@ -669,7 +716,7 @@ impl EvidenceView {
                     .child(div().flex_1())
                     .child(
                         Label::new(format!(
-                            "{author} · {} · {exit_label}",
+                            "{attribution} · {} · {exit_label}",
                             relative_time(created_at)
                         ))
                         .size(LabelSize::XSmall)
@@ -1257,11 +1304,15 @@ impl MissionStatusIndicator {
         }
     }
 
-    /// Missions are created rarely and `ThreadMetadataStore` publishes no
-    /// change events, so the indicator re-reads the Mission list on a slow
-    /// timer rather than trying to observe a store that can't be observed.
+    /// Re-reads the Mission list on a slow timer.
+    ///
+    /// `ThreadMetadataStore` *is* observable --- `MissionPanel` observes it ---
+    /// but observing it here would be the wrong trade. It notifies on every new
+    /// entry in every thread, and all this indicator needs from it is the
+    /// Mission list, which changes only when a Mission is created. A five
+    /// second poll costs one query; the observation would cost one per entry.
     /// Everything that changes second-to-second comes from the live threads,
-    /// which are read on every render.
+    /// which are read on every render anyway.
     fn spawn_refresh(cx: &mut Context<Self>) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
             loop {

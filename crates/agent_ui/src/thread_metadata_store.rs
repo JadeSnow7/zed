@@ -128,19 +128,22 @@ pub(crate) fn list_thread_metadata_from_connection(
     connection.select::<ThreadMetadata>(ThreadMetadataDb::LIST_QUERY)?()
 }
 
-/// Run the `ThreadMetadataDb` migrations on a raw connection.
+/// Run the thread metadata migrations on a raw connection.
 ///
 /// This is used in tests to set up the sidebar_threads schema in a
-/// temporary database.
+/// temporary database. Both domains, in dependency order: `MissionDb` adds
+/// columns that `ThreadMetadataDb::LIST_QUERY` selects, so a connection
+/// carrying only the upstream domain fails every read, not just Mission ones.
 #[cfg(test)]
 pub(crate) fn run_thread_metadata_migrations(connection: &db::sqlez::connection::Connection) {
-    connection
-        .migrate(
-            ThreadMetadataDb::NAME,
-            ThreadMetadataDb::MIGRATIONS,
-            &mut |_, _, _| false,
-        )
-        .expect("thread metadata migrations should succeed");
+    for (name, migrations) in [
+        (ThreadMetadataDb::NAME, ThreadMetadataDb::MIGRATIONS),
+        (MissionDb::NAME, MissionDb::MIGRATIONS),
+    ] {
+        connection
+            .migrate(name, migrations, &mut |_, _, _| false)
+            .expect("thread metadata migrations should succeed");
+    }
 }
 
 pub fn init(cx: &mut App) {
@@ -572,6 +575,17 @@ pub struct ThreadMetadataStore {
     threads_by_session: HashMap<acp::SessionId, ThreadId>,
     reload_task: Option<Shared<Task<()>>>,
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
+    /// Mission assignments for threads whose metadata entry does not exist yet.
+    ///
+    /// A thread's entry is only created on its first `RootThreadUpdated`, which
+    /// is seconds of asynchronous connection setup away for an external
+    /// Harness. Callers that know a thread's Mission at creation time
+    /// (`mission_orchestrator`) therefore call [`Self::set_thread_mission`]
+    /// before there is anything to write it to. Parking the assignment here
+    /// lets `handle_conversation_event` apply it in the same write that creates
+    /// the entry, instead of the caller re-asserting it from a subscription and
+    /// hoping one of the attempts lands.
+    pending_mission_assignments: HashMap<ThreadId, (Option<MissionId>, Option<String>)>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
     _db_operations_task: Task<()>,
@@ -629,7 +643,7 @@ impl ThreadMetadataStore {
     #[cfg(any(test, feature = "test-support"))]
     pub fn init_global(cx: &mut App) {
         let db_name = TestMetadataDbName::global(cx);
-        let db = gpui::block_on(db::open_test_db::<ThreadMetadataDb>(&db_name));
+        let db = gpui::block_on(db::open_test_db::<(ThreadMetadataDb, MissionDb)>(&db_name));
         let thread_store = cx.new(|cx| Self::new(ThreadMetadataDb(db), cx));
         cx.set_global(GlobalThreadMetadataStore(thread_store));
     }
@@ -826,6 +840,14 @@ impl ThreadMetadataStore {
         cx: &mut Context<Self>,
     ) {
         let Some(existing) = self.entry(thread_id) else {
+            // No entry yet --- the thread's connection has not produced its
+            // first `RootThreadUpdated`. Park the assignment rather than
+            // dropping it; `handle_conversation_event` applies it when it
+            // creates the entry. Dropping it here is what produced orphan
+            // workers: the thread existed, its Mission prompt had already been
+            // submitted, and nothing ever labelled it.
+            self.pending_mission_assignments
+                .insert(thread_id, (mission_id, role));
             return;
         };
         if existing.mission_id == mission_id && existing.role == role {
@@ -854,7 +876,11 @@ impl ThreadMetadataStore {
     }
 
     /// Returns the Mission with the given id, if it exists.
-    pub fn get_mission(&self, mission_id: MissionId, cx: &App) -> Task<anyhow::Result<Option<Mission>>> {
+    pub fn get_mission(
+        &self,
+        mission_id: MissionId,
+        cx: &App,
+    ) -> Task<anyhow::Result<Option<Mission>>> {
         let db = self.db.clone();
         cx.background_spawn(async move { db.get_mission(mission_id).await })
     }
@@ -865,7 +891,21 @@ impl ThreadMetadataStore {
         cx.background_spawn(async move { db.list_missions() })
     }
 
-    fn save_internal(&mut self, metadata: ThreadMetadata) {
+    fn save_internal(&mut self, mut metadata: ThreadMetadata) {
+        // If this write is the one creating the entry, and someone assigned the
+        // thread to a Mission before it existed, the assignment belongs in this
+        // row rather than in a follow-up update that may never happen. Every
+        // write funnels through here; `reload` populates the cache directly, so
+        // rows coming back from the database are not affected.
+        if !self.threads.contains_key(&metadata.thread_id) {
+            if let Some((mission_id, role)) =
+                self.pending_mission_assignments.remove(&metadata.thread_id)
+            {
+                metadata.mission_id = mission_id;
+                metadata.role = role;
+            }
+        }
+
         if let Some(thread) = self.threads.get(&metadata.thread_id) {
             if thread.folder_paths() != metadata.folder_paths() {
                 if let Some(thread_ids) = self.threads_by_paths.get_mut(thread.folder_paths()) {
@@ -1282,6 +1322,7 @@ impl ThreadMetadataStore {
             }
         }
         self.threads.remove(&thread_id);
+        self.pending_mission_assignments.remove(&thread_id);
         self.pending_thread_ops_tx
             .try_send(DbOperation::Delete(thread_id))
             .log_err();
@@ -1370,6 +1411,7 @@ impl ThreadMetadataStore {
             threads_by_session: HashMap::default(),
             reload_task: None,
             conversation_subscriptions: HashMap::default(),
+            pending_mission_assignments: HashMap::default(),
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
             _db_operations_task,
@@ -1417,6 +1459,9 @@ impl ThreadMetadataStore {
         };
         let title = thread_ref.title();
         let title_override = existing_thread.and_then(|t| t.title_override.clone());
+        // Carry-over only. A thread whose entry does not exist yet gets its
+        // Mission from the assignment parked in the store; `save_internal`
+        // applies it, so every write that creates a row goes through one place.
         let mission_id = existing_thread.and_then(|t| t.mission_id);
         let role = existing_thread.and_then(|t| t.role.clone());
 
@@ -1593,7 +1638,47 @@ impl Domain for ThreadMetadataDb {
         sql!(
             ALTER TABLE sidebar_threads ADD COLUMN title_override TEXT;
         ),
-        sql!(
+    ];
+}
+
+db::static_connection!(ThreadMetadataDb, []);
+
+/// The Mission tables, kept in their own migration domain rather than appended
+/// to [`ThreadMetadataDb`]'s list.
+///
+/// `sqlez` compares stored migrations to current ones *by index* and aborts the
+/// whole database open on a mismatch (see `sqlez::migrations`), which drops the
+/// user into `crates/db`'s in-memory fallback --- every thread, every Mission,
+/// gone for that session. Appending to an upstream domain's array therefore
+/// claims an index that upstream is free to use for its own next migration, and
+/// the collision surfaces one rebase later as data loss rather than as a merge
+/// conflict. A separate domain has no shared index space, and no shared lines
+/// for `git` to conflict over either.
+///
+/// The `ThreadMetadataDb` dependency is load-bearing, not decorative:
+/// `static_connection!` feeds it to `AppMigrator`'s topological sort, and these
+/// statements alter `sidebar_threads`, which the upstream domain creates.
+///
+/// Same file as everything else (`db.sqlite`) --- a domain is a migration
+/// namespace, not a database --- so joins across `missions` and
+/// `sidebar_threads` keep working.
+mod mission_db {
+    // `static_connection!` also generates connection accessors (`global`,
+    // `open_test_db`). Nothing calls them: this type carries migrations, and
+    // the connection is reached through `ThreadMetadataDb`, which points at the
+    // same file. `./script/clippy` runs with `--deny warnings`, so the unused
+    // accessors have to be allowed rather than tolerated --- hence the module,
+    // which scopes the allow to the macro expansion instead of the file.
+    #![allow(dead_code)]
+
+    use super::*;
+
+    pub(crate) struct MissionDb(ThreadSafeConnection);
+
+    impl Domain for MissionDb {
+        const NAME: &str = stringify!(MissionDb);
+
+        const MIGRATIONS: &[&str] = &[sql!(
             CREATE TABLE IF NOT EXISTS missions(
                 id BLOB PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -1602,11 +1687,14 @@ impl Domain for ThreadMetadataDb {
 
             ALTER TABLE sidebar_threads ADD COLUMN mission_id BLOB;
             ALTER TABLE sidebar_threads ADD COLUMN role TEXT;
-        ),
-    ];
+        )];
+    }
+
+    db::static_connection!(MissionDb, [ThreadMetadataDb]);
 }
 
-db::static_connection!(ThreadMetadataDb, []);
+#[cfg(any(test, feature = "test-support"))]
+use mission_db::MissionDb;
 
 impl ThreadMetadataDb {
     #[allow(dead_code)]
@@ -1743,7 +1831,9 @@ impl ThreadMetadataDb {
 
     /// List all Missions, most recently created first.
     pub fn list_missions(&self) -> anyhow::Result<Vec<Mission>> {
-        self.select::<Mission>("SELECT id, title, created_at FROM missions ORDER BY created_at DESC")?()
+        self.select::<Mission>(
+            "SELECT id, title, created_at FROM missions ORDER BY created_at DESC",
+        )?()
     }
 
     /// Delete metadata for a single thread.
@@ -2143,9 +2233,10 @@ mod tests {
         let thread = std::thread::current();
         let test_name = thread.name().unwrap_or("unknown_test");
         let db_name = format!("THREAD_METADATA_DB_{}", test_name);
-        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
-            &db_name,
-        )));
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<(
+            ThreadMetadataDb,
+            MissionDb,
+        )>(&db_name)));
 
         db.save(metadata).await.unwrap();
 
@@ -2231,9 +2322,10 @@ mod tests {
         let thread = std::thread::current();
         let test_name = thread.name().unwrap_or("unknown_test");
         let db_name = format!("THREAD_METADATA_DB_{}", test_name);
-        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
-            &db_name,
-        )));
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<(
+            ThreadMetadataDb,
+            MissionDb,
+        )>(&db_name)));
 
         db.save(make_metadata(
             "session-1",
@@ -4481,9 +4573,10 @@ mod tests {
         let thread = std::thread::current();
         let test_name = thread.name().unwrap_or("unknown_test");
         let db_name = format!("THREAD_METADATA_DB_{}", test_name);
-        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
-            &db_name,
-        )));
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<(
+            ThreadMetadataDb,
+            MissionDb,
+        )>(&db_name)));
 
         db.save(metadata).await.unwrap();
 
@@ -4498,9 +4591,10 @@ mod tests {
         let thread = std::thread::current();
         let test_name = thread.name().unwrap_or("unknown_test");
         let db_name = format!("THREAD_METADATA_DB_{}", test_name);
-        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<ThreadMetadataDb>(
-            &db_name,
-        )));
+        let db = ThreadMetadataDb(gpui::block_on(db::open_test_db::<(
+            ThreadMetadataDb,
+            MissionDb,
+        )>(&db_name)));
 
         let mission = Mission {
             id: MissionId::new(),
@@ -4517,6 +4611,114 @@ mod tests {
 
         let missing = db.get_mission(MissionId::new()).await.unwrap();
         assert_eq!(missing, None);
+    }
+
+    /// The orphan-worker race: `mission_orchestrator` assigns a Mission the
+    /// instant it creates a thread, but the thread's metadata entry is only
+    /// written when its connection produces the first `RootThreadUpdated` ---
+    /// seconds later for an external Harness. The assignment used to be dropped
+    /// on the floor, leaving a worker that had already been handed its Mission
+    /// prompt but never appeared under that Mission.
+    #[gpui::test]
+    async fn test_mission_assigned_before_entry_exists_is_applied_on_create(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let mission_id = MissionId::new();
+        let metadata = make_metadata(
+            "session-late",
+            "Worker whose connection is still coming up",
+            Utc::now(),
+            PathList::default(),
+        );
+        let thread_id = metadata.thread_id;
+
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                // Assigned before anything exists to assign it to.
+                assert!(store.entry(thread_id).is_none());
+                store.set_thread_mission(
+                    thread_id,
+                    Some(mission_id),
+                    Some("coding".to_string()),
+                    cx,
+                );
+                assert!(
+                    store.entry(thread_id).is_none(),
+                    "parking an assignment must not conjure an entry"
+                );
+
+                // ... and applied by the write that finally creates the entry,
+                // even though that write knows nothing about Missions.
+                store.save(metadata, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            let entry = store.entry(thread_id).expect("entry should exist");
+            assert_eq!(entry.mission_id, Some(mission_id));
+            assert_eq!(entry.role.as_deref(), Some("coding"));
+            assert_eq!(
+                store.entries_for_mission(mission_id).count(),
+                1,
+                "the worker must show up under its Mission, not as ungrouped"
+            );
+        });
+    }
+
+    /// The flip side: a parked assignment is consumed once, so an ordinary
+    /// metadata update later on cannot resurrect it and silently revert a
+    /// reassignment. This is what the old `RootThreadUpdated` re-assert
+    /// subscription got wrong.
+    #[gpui::test]
+    async fn test_parked_mission_assignment_does_not_revert_later_changes(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let original_mission = MissionId::new();
+        let new_mission = MissionId::new();
+        let metadata = make_metadata(
+            "session-reassigned",
+            "Worker that gets moved",
+            Utc::now(),
+            PathList::default(),
+        );
+        let thread_id = metadata.thread_id;
+
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+                store.set_thread_mission(
+                    thread_id,
+                    Some(original_mission),
+                    Some("coding".to_string()),
+                    cx,
+                );
+                store.save(metadata, cx);
+
+                // Reassign, then let an unrelated metadata update land on top.
+                store.set_thread_mission(
+                    thread_id,
+                    Some(new_mission),
+                    Some("review".to_string()),
+                    cx,
+                );
+                let refreshed = store.entry(thread_id).unwrap().clone();
+                store.save(refreshed, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            let entry = store.entry(thread_id).expect("entry should exist");
+            assert_eq!(entry.mission_id, Some(new_mission));
+            assert_eq!(entry.role.as_deref(), Some("review"));
+            assert_eq!(store.entries_for_mission(original_mission).count(), 0);
+        });
     }
 
     #[gpui::test]
@@ -4607,7 +4809,9 @@ mod tests {
         let mission = cx
             .update(|cx| {
                 let store = ThreadMetadataStore::global(cx);
-                store.read(cx).create_mission("Ship the feature".to_string(), cx)
+                store
+                    .read(cx)
+                    .create_mission("Ship the feature".to_string(), cx)
             })
             .await
             .unwrap();
@@ -4635,16 +4839,20 @@ mod tests {
     fn test_mission_migration_preserves_existing_threads_with_null_mission_and_role() {
         use db::sqlez::connection::Connection;
 
-        let connection = Connection::open_memory(Some(
-            "test_mission_migration_preserves_existing_threads",
-        ));
+        let connection =
+            Connection::open_memory(Some("test_mission_migration_preserves_existing_threads"));
 
-        // Run every migration except the one that introduces `missions` and
-        // the `mission_id`/`role` columns, simulating an already-existing
-        // database from before Missions existed.
-        let old_migrations = &ThreadMetadataDb::MIGRATIONS[..ThreadMetadataDb::MIGRATIONS.len() - 1];
+        // Run only the upstream domain, simulating an already-existing
+        // database from before Missions existed. Since `MissionDb` was split
+        // out into its own domain this is just "everything but MissionDb" ---
+        // no index arithmetic, and nothing to keep in sync when upstream
+        // appends a migration.
         connection
-            .migrate(ThreadMetadataDb::NAME, old_migrations, &mut |_, _, _| false)
+            .migrate(
+                ThreadMetadataDb::NAME,
+                ThreadMetadataDb::MIGRATIONS,
+                &mut |_, _, _| false,
+            )
             .expect("pre-mission migrations should succeed");
 
         connection

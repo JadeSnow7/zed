@@ -16,14 +16,16 @@
 //! for those, only the persisted Shared Context sections render, alongside an
 //! "Open thread" prompt.
 
-use acp_thread::{AcpThread, AgentThreadEntry, ToolCall, ToolCallStatus};
+use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk, ToolCall, ToolCallStatus};
 use agent_client_protocol::schema::v1 as acp;
 use editor::Editor;
 use gpui::{
-    AnyElement, App, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Subscription,
-    WeakEntity,
+    AnyElement, App, Entity, EventEmitter, FocusHandle, Focusable, KeyContext, SharedString,
+    Subscription, WeakEntity,
 };
 use project::{AgentId, AgentServerStore};
+use settings::Settings;
+use std::collections::VecDeque;
 use ui::{ContextMenu, Icon, IconName, Indicator, PopoverMenu, Tooltip, prelude::*};
 use workspace::{
     Workspace,
@@ -31,10 +33,12 @@ use workspace::{
 };
 
 use crate::{
-    Agent, AgentPanel, AgentThreadSource, MissionThreadState,
+    Agent, AgentPanel, AgentThreadSource, MissionThreadState, SendWorkerInstruction,
+    conversation_view::ThreadView,
     mission_context_observer::shared_context_store,
     mission_panel::{
-        bilingual_label, format_token_count, last_assistant_summary, send_to_worker, worker_label,
+        bilingual_label, format_token_count, last_assistant_summary, send_to_worker_view,
+        worker_label,
     },
     thread_metadata_store::{MissionId, ThreadId, ThreadMetadata, ThreadMetadataStore},
     thread_mission_state,
@@ -50,9 +54,13 @@ pub struct WorkerSnapshot {
     /// Whether `AgentPanel` currently holds this worker's thread. When it
     /// doesn't, no runtime state is readable and the tab offers to open it.
     thread_loaded: bool,
+    generating: bool,
     permission: Option<PendingPermission>,
     current_tool_call: Option<CurrentToolCall>,
     changes: Vec<ChangedFile>,
+    recent_instruction: Option<SharedString>,
+    recent_response: Option<SharedString>,
+    queued_messages: usize,
 }
 
 impl WorkerSnapshot {
@@ -60,9 +68,9 @@ impl WorkerSnapshot {
     /// distinct from the thread not being loaded at all.
     fn is_idle(&self) -> bool {
         self.thread_loaded
+            && !self.generating
             && self.permission.is_none()
             && self.current_tool_call.is_none()
-            && self.changes.is_empty()
     }
 }
 
@@ -204,8 +212,15 @@ pub struct WorkerDashboard {
     /// against the live one to notice a thread being loaded or dropped by
     /// `AgentPanel` while this tab is open.
     observed_thread: Option<Entity<AcpThread>>,
+    observed_thread_view: Option<Entity<ThreadView>>,
     _thread_observation: Option<Subscription>,
+    _thread_view_observation: Option<Subscription>,
     _panel_observation: Option<Subscription>,
+    _editor_observation: Option<Subscription>,
+    feedback: Option<SharedString>,
+    latest_submitted_instruction: Option<SharedString>,
+    submission_id: u64,
+    failed_instructions: VecDeque<SharedString>,
 }
 
 impl WorkerDashboard {
@@ -275,8 +290,15 @@ impl WorkerDashboard {
             instruction_editor,
             context_state: WorkerContextState::Loading,
             observed_thread: None,
+            observed_thread_view: None,
             _thread_observation: None,
+            _thread_view_observation: None,
             _panel_observation: None,
+            _editor_observation: None,
+            feedback: None,
+            latest_submitted_instruction: None,
+            submission_id: 0,
+            failed_instructions: VecDeque::new(),
         };
 
         if let Some(panel) = agent_panel {
@@ -296,6 +318,8 @@ impl WorkerDashboard {
             .detach();
             this.observe_thread_of(&panel, cx);
         }
+        let editor = this.instruction_editor.clone();
+        this._editor_observation = Some(cx.observe(&editor, |_, _, cx| cx.notify()));
         this.refresh_context(cx);
         this
     }
@@ -312,6 +336,17 @@ impl WorkerDashboard {
             .conversation_view_for_id(&self.thread_id, cx)?
             .read(cx)
             .root_thread(cx)
+    }
+
+    /// The worker's `ThreadView`, used to send it a message; see
+    /// `mission_panel::send_to_worker_view`.
+    fn thread_view(&self, cx: &App) -> Option<Entity<ThreadView>> {
+        let panel = self.agent_panel(cx)?;
+        let panel = panel.read(cx);
+        panel
+            .conversation_view_for_id(&self.thread_id, cx)?
+            .read(cx)
+            .root_thread_view()
     }
 
     fn agent_server_store(&self, cx: &App) -> Option<Entity<AgentServerStore>> {
@@ -344,21 +379,55 @@ impl WorkerDashboard {
     }
 
     fn observe_thread_of(&mut self, panel: &Entity<AgentPanel>, cx: &mut Context<Self>) {
-        let thread = panel
+        let thread_view = panel
             .read(cx)
             .conversation_view_for_id(&self.thread_id, cx)
-            .and_then(|view| view.read(cx).root_thread(cx));
+            .and_then(|view| view.read(cx).root_thread_view());
+        let thread = thread_view
+            .as_ref()
+            .map(|view| view.read(cx).thread.clone());
         if thread.as_ref().map(Entity::entity_id)
             == self.observed_thread.as_ref().map(Entity::entity_id)
+            && thread_view.as_ref().map(Entity::entity_id)
+                == self.observed_thread_view.as_ref().map(Entity::entity_id)
         {
             return;
         }
 
-        self._thread_observation = thread
+        self._thread_observation = thread.as_ref().map(|thread| {
+            cx.observe(thread, |this, _, cx| {
+                this.clear_submitted_instruction_if_reflected(cx);
+                cx.notify();
+            })
+        });
+        self._thread_view_observation = thread_view
             .as_ref()
-            .map(|thread| cx.observe(thread, |_, _, cx| cx.notify()));
+            .map(|view| cx.observe(view, |_, _, cx| cx.notify()));
         self.observed_thread = thread;
+        self.observed_thread_view = thread_view;
         cx.notify();
+    }
+
+    fn clear_submitted_instruction_if_reflected(&mut self, cx: &mut Context<Self>) {
+        let Some(submitted) = self.latest_submitted_instruction.as_ref() else {
+            return;
+        };
+        let Some(thread) = self.observed_thread.as_ref() else {
+            return;
+        };
+        let latest_user_message =
+            thread
+                .read(cx)
+                .entries()
+                .iter()
+                .rev()
+                .find_map(|entry| match entry {
+                    AgentThreadEntry::UserMessage(message) => Some(message.content.to_markdown(cx)),
+                    _ => None,
+                });
+        if latest_user_message.as_deref() == Some(submitted.as_ref()) {
+            self.latest_submitted_instruction = None;
+        }
     }
 
     fn refresh_context(&mut self, cx: &mut Context<Self>) {
@@ -383,6 +452,15 @@ impl WorkerDashboard {
             .ok();
         })
         .detach();
+    }
+
+    fn send_instruction_action(
+        &mut self,
+        _: &SendWorkerInstruction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.send_instruction(window, cx);
     }
 
     fn state(&self, cx: &App) -> MissionThreadState {
@@ -440,12 +518,59 @@ impl WorkerDashboard {
         if instruction.is_empty() {
             return;
         }
-        let Some(thread) = self.thread(cx) else {
+        let Some(thread_view) = self.thread_view(cx) else {
             return;
         };
-        send_to_worker(&thread, instruction, cx);
+        let is_idle =
+            thread_view.read(cx).thread.read(cx).status() == acp_thread::ThreadStatus::Idle;
+        let instruction_for_restore = instruction.clone();
+        self.latest_submitted_instruction = Some(instruction.clone().into());
+        let clear_feedback_on_success = is_idle;
+        self.submission_id = self.submission_id.wrapping_add(1);
+        let submission_id = self.submission_id;
         self.instruction_editor
             .update(cx, |editor, cx| editor.clear(window, cx));
+        self.feedback = Some(if is_idle {
+            "Submitted — waiting for response".into()
+        } else {
+            "Queued — will send when the current turn finishes".into()
+        });
+        cx.notify();
+        let send = send_to_worker_view(&thread_view, instruction, window, cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let result = send.await;
+            this.update_in(cx, |this, _window, cx| {
+                match result {
+                    Ok(()) => {
+                        if clear_feedback_on_success && this.submission_id == submission_id {
+                            this.feedback = None;
+                        }
+                    }
+                    Err(error) => {
+                        if this.submission_id == submission_id {
+                            this.feedback = Some(format!("Send failed: {error:#}").into());
+                        }
+                        this.failed_instructions
+                            .push_back(instruction_for_restore.clone().into());
+                        log::error!("Could not send worker instruction: {error:#}");
+                    }
+                }
+                cx.notify();
+            })
+        })
+        .detach();
+    }
+
+    fn restore_failed_instruction(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(instruction) = self.failed_instructions.front().cloned() else {
+            return;
+        };
+        if !self.instruction_editor.read(cx).text(cx).trim().is_empty() {
+            return;
+        }
+        self.instruction_editor
+            .update(cx, |editor, cx| editor.set_text(instruction, window, cx));
+        self.failed_instructions.pop_front();
         cx.notify();
     }
 
@@ -469,24 +594,36 @@ impl WorkerDashboard {
             format!("Handing off from {}. Please pick this up.", self.role)
         };
 
-        let target_thread = self.agent_panel(cx).and_then(|panel| {
+        let target_thread_view = self.agent_panel(cx).and_then(|panel| {
             panel
                 .read(cx)
                 .conversation_view_for_id(&target.thread_id, cx)?
                 .read(cx)
-                .root_thread(cx)
+                .root_thread_view()
         });
 
-        let Some(target_thread) = target_thread else {
+        let Some(target_thread_view) = target_thread_view else {
             // Nothing to send to yet. Put the receiving worker on screen so
             // the user can start it, rather than silently dropping the handoff.
             self.open_thread_for(&target, window, cx);
             return;
         };
 
-        send_to_worker(&target_thread, message, cx);
-        self.instruction_editor
-            .update(cx, |editor, cx| editor.clear(window, cx));
+        let send = send_to_worker_view(&target_thread_view, message, window, cx);
+        let note_for_clear = note.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = send.await;
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(()) => {
+                    if this.instruction_editor.read(cx).text(cx).trim() == note_for_clear {
+                        this.instruction_editor
+                            .update(cx, |editor, cx| editor.clear(window, cx));
+                    }
+                }
+                Err(error) => log::error!("Could not hand off worker instruction: {error:#}"),
+            })
+        })
+        .detach();
         self.open_thread_for(&target, window, cx);
     }
 
@@ -576,7 +713,16 @@ impl WorkerDashboard {
     /// without opening its conversation.
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state(cx);
-        let (status_label, status_color) = worker_status(state);
+        let (default_status_label, status_color) = worker_status(state);
+        let status_label = if state == MissionThreadState::Running
+            && self
+                .thread(cx)
+                .is_some_and(|thread| active_tool_call(&thread.read(cx)).is_none())
+        {
+            "Waiting for response"
+        } else {
+            default_status_label
+        };
         let store = self.agent_server_store(cx);
         let agent_label = self.metadata(cx).map(|metadata| {
             store
@@ -700,9 +846,6 @@ impl WorkerDashboard {
     /// The one-line "where it stands" strip under the header, plus what the
     /// turn has cost so far and what, if anything, it is blocked on.
     fn render_summary(&self, snapshot: &WorkerSnapshot, cx: &mut Context<Self>) -> AnyElement {
-        let summary = self
-            .thread(cx)
-            .and_then(|thread| last_assistant_summary(thread.read(cx), cx));
         let thread = self.thread(cx);
         let tokens = thread
             .as_ref()
@@ -722,7 +865,6 @@ impl WorkerDashboard {
             .py_2()
             .gap_0p5()
             .bg(cx.theme().colors().element_background)
-            .children(summary.map(|summary| Label::new(summary).size(LabelSize::Small)))
             .child(
                 h_flex()
                     .gap_1p5()
@@ -754,13 +896,38 @@ impl WorkerDashboard {
     /// thread; this exists so a one-line correction doesn't require leaving
     /// the tab, and it deliberately shows no conversation of its own.
     fn render_composer(&self, cx: &mut Context<Self>) -> AnyElement {
-        let can_send = self.thread(cx).is_some();
+        let thread_loaded = self.thread(cx).is_some();
+        let can_send =
+            thread_loaded && !self.instruction_editor.read(cx).text(cx).trim().is_empty();
+        let queued_messages = self
+            .thread_view(cx)
+            .map(|view| view.read(cx).message_queue.len())
+            .unwrap_or_default();
+        let use_modifier_to_send =
+            agent_settings::AgentSettings::get_global(cx).use_modifier_to_send;
+        let mut key_context = KeyContext::default();
+        key_context.add("WorkerInstructionEditor");
+        if use_modifier_to_send {
+            key_context.add("use_modifier_to_send");
+        }
+        let feedback = self
+            .feedback
+            .as_ref()
+            .filter(|feedback| !(feedback.as_ref().starts_with("Queued") && queued_messages == 0));
+        let send_hint = if use_modifier_to_send {
+            "Modifier+Enter sends · Enter inserts a newline"
+        } else {
+            "Enter sends · Shift+Enter inserts a newline"
+        };
+        let can_restore = self.instruction_editor.read(cx).text(cx).trim().is_empty();
 
         v_flex()
             .w_full()
             .flex_none()
             .p_2()
             .gap_1()
+            .key_context(key_context)
+            .on_action(cx.listener(Self::send_instruction_action))
             .border_t_1()
             .border_color(cx.theme().colors().border)
             .child(
@@ -778,10 +945,14 @@ impl WorkerDashboard {
                     .gap_1()
                     .items_center()
                     .child(
-                        Label::new(if can_send {
-                            "Goes to this worker as a user message"
+                        Label::new(if let Some(feedback) = feedback {
+                            feedback.clone().to_string()
+                        } else if can_send {
+                            send_hint.to_string()
+                        } else if thread_loaded {
+                            "Type an instruction to send".to_string()
                         } else {
-                            "Open the thread first to send an instruction"
+                            "Open the thread first to send an instruction".to_string()
                         })
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
@@ -799,6 +970,16 @@ impl WorkerDashboard {
                             ),
                     ),
             )
+            .when(!self.failed_instructions.is_empty(), |this| {
+                this.child(
+                    Button::new("worker-restore-instruction", "Restore failed instruction")
+                        .label_size(LabelSize::Small)
+                        .disabled(!can_restore)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.restore_failed_instruction(window, cx)
+                        })),
+                )
+            })
             .into_any_element()
     }
 
@@ -879,6 +1060,10 @@ impl WorkerDashboard {
         let Some(thread) = self.thread(cx) else {
             return WorkerSnapshot::default();
         };
+        let queued_messages = self
+            .thread_view(cx)
+            .map(|view| view.read(cx).message_queue.len())
+            .unwrap_or_default();
         let thread = thread.read(cx);
 
         let changes = thread
@@ -899,8 +1084,58 @@ impl WorkerDashboard {
             })
             .collect();
 
+        let entries = thread.entries();
+        let recent_user_index = entries
+            .iter()
+            .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)));
+        let recent_instruction_from_thread =
+            recent_user_index.and_then(|index| match &entries[index] {
+                AgentThreadEntry::UserMessage(message) => {
+                    Some(message.content.to_markdown(cx).into())
+                }
+                _ => None,
+            });
+        let recent_instruction = self
+            .latest_submitted_instruction
+            .clone()
+            .or(recent_instruction_from_thread.clone());
+        let can_show_response = match (
+            &self.latest_submitted_instruction,
+            &recent_instruction_from_thread,
+        ) {
+            (Some(submitted), Some(thread)) => submitted == thread,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        let recent_response = can_show_response
+            .then(|| {
+                recent_user_index.and_then(|index| {
+                    entries[index + 1..]
+                        .iter()
+                        .rev()
+                        .find_map(|entry| match entry {
+                            AgentThreadEntry::AssistantMessage(message) => {
+                                let text = message
+                                    .chunks
+                                    .iter()
+                                    .filter_map(|chunk| match chunk {
+                                        AssistantMessageChunk::Message { block, .. } => {
+                                            Some(block.to_markdown(cx))
+                                        }
+                                        AssistantMessageChunk::Thought { .. } => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n\n");
+                                (!text.trim().is_empty()).then_some(text.into())
+                            }
+                            _ => None,
+                        })
+                })
+            })
+            .flatten();
         WorkerSnapshot {
             thread_loaded: true,
+            generating: thread.status() == acp_thread::ThreadStatus::Generating,
             permission: PendingPermission::for_thread(thread, cx),
             current_tool_call: active_tool_call(thread).map(|call| CurrentToolCall {
                 label: call.label.read(cx).source().clone(),
@@ -912,6 +1147,9 @@ impl WorkerDashboard {
                     .join(", "),
             }),
             changes,
+            recent_instruction,
+            recent_response,
+            queued_messages,
         }
     }
 
@@ -937,9 +1175,14 @@ impl WorkerDashboard {
             .collect()
     }
 
-    /// Shared Context rows this worker recorded. The observer attributes rows
-    /// to a thread's Mission role (see `mission_context_observer`), which is
-    /// what makes this filter line up with what the worker actually did.
+    /// Shared Context rows belonging to this worker.
+    ///
+    /// Filtered on the row's `role`, not its `author`. `author` says who
+    /// recorded a row --- `zed-observer` for rows Zed derived, or a Harness's
+    /// own self-reported name --- and matching a role against that meant a
+    /// worker's own `record_decision` calls, which arrive as e.g.
+    /// `"claude-code"`, never matched the role and so never showed up on its
+    /// own page. See `shared_context::Decision::role`.
     fn render_recorded(&self) -> Vec<AnyElement> {
         let context = match &self.context_state {
             WorkerContextState::Loaded(context) => context,
@@ -963,7 +1206,11 @@ impl WorkerDashboard {
 
         let role = self.role.as_ref();
         let mut rows = Vec::new();
-        for decision in context.decisions.iter().filter(|row| row.author == role) {
+        for decision in context
+            .decisions
+            .iter()
+            .filter(|row| row.role.as_deref() == Some(role))
+        {
             rows.push(
                 h_flex()
                     .gap_2()
@@ -977,7 +1224,11 @@ impl WorkerDashboard {
                     .into_any_element(),
             );
         }
-        for evidence in context.evidence.iter().filter(|row| row.author == role) {
+        for evidence in context
+            .evidence
+            .iter()
+            .filter(|row| row.role.as_deref() == Some(role))
+        {
             let succeeded = evidence.exit_code == Some(0);
             rows.push(
                 h_flex()
@@ -1020,6 +1271,8 @@ impl Render for WorkerDashboard {
         let has_changes = !snapshot.changes.is_empty();
 
         let summary = self.render_summary(&snapshot, cx);
+        let has_permission = snapshot.permission.is_some();
+        let has_current_tool_call = snapshot.current_tool_call.is_some();
         let current = snapshot
             .current_tool_call
             .map(|call| self.render_current_tool_call(call, cx));
@@ -1027,6 +1280,26 @@ impl Render for WorkerDashboard {
         let permission = snapshot
             .permission
             .map(|permission| self.render_permission_request(permission, cx));
+        let recent_instruction = snapshot.recent_instruction.map(|instruction| {
+            self.render_section(
+                "LATEST INSTRUCTION",
+                "最近指令",
+                [Label::new(instruction)
+                    .size(LabelSize::Small)
+                    .into_any_element()],
+            )
+            .into_any_element()
+        });
+        let recent_response = snapshot.recent_response.map(|response| {
+            self.render_section(
+                "LATEST RESPONSE",
+                "最新回复",
+                [Label::new(response)
+                    .size(LabelSize::Small)
+                    .into_any_element()],
+            )
+            .into_any_element()
+        });
 
         v_flex()
             .size_full()
@@ -1066,7 +1339,29 @@ impl Render for WorkerDashboard {
                                 .color(Color::Muted),
                         )
                     })
+                    .when(
+                        snapshot.generating && !has_permission && !has_current_tool_call,
+                        |this| {
+                            this.child(
+                                Label::new("Waiting for response")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        },
+                    )
                     .children(permission)
+                    .children(recent_instruction)
+                    .children(recent_response)
+                    .when(snapshot.queued_messages > 0, |this| {
+                        this.child(
+                            Label::new(format!(
+                                "{} instruction(s) queued",
+                                snapshot.queued_messages
+                            ))
+                            .size(LabelSize::Small)
+                            .color(Color::Warning),
+                        )
+                    })
                     .children(current.map(|current| {
                         self.render_section("CURRENT TOOL CALL", "当前工具调用", [current])
                             .into_any_element()
@@ -1135,6 +1430,8 @@ impl Item for WorkerDashboard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use acp_thread::StubAgentConnection;
+    use gpui::TestAppContext;
 
     #[test]
     fn an_unloaded_thread_is_not_idle() {
@@ -1146,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn a_loaded_worker_with_changes_is_not_idle() {
+    fn a_loaded_worker_with_changes_is_idle() {
         let snapshot = WorkerSnapshot {
             thread_loaded: true,
             changes: vec![ChangedFile {
@@ -1156,7 +1453,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(!snapshot.is_idle());
+        assert!(snapshot.is_idle());
     }
 
     #[test]
@@ -1173,5 +1470,145 @@ mod tests {
         assert_eq!(worker_status(MissionThreadState::Running).1, Color::Success);
         assert_eq!(worker_status(MissionThreadState::Waiting).1, Color::Warning);
         assert_eq!(worker_status(MissionThreadState::Failed).1, Color::Error);
+    }
+
+    #[gpui::test]
+    async fn sending_clears_immediately_and_does_not_overwrite_a_new_draft(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, _panel, thread_metadata, _, mut cx) =
+            crate::mission_panel::tests::setup_workspace_with_two_threads(cx).await;
+        let dashboard = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let agent_panel = workspace.panel::<AgentPanel>(cx);
+            cx.new(|cx| {
+                WorkerDashboard::new(
+                    MissionId::new(),
+                    "Test mission".into(),
+                    thread_metadata.clone(),
+                    workspace.weak_handle(),
+                    agent_panel,
+                    window,
+                    cx,
+                )
+            })
+        });
+
+        dashboard.update_in(&mut cx, |dashboard, window, cx| {
+            dashboard.instruction_editor.update(cx, |editor, cx| {
+                editor.set_text("first instruction", window, cx);
+            });
+            dashboard.send_instruction(window, cx);
+            assert_eq!(
+                dashboard.instruction_editor.read(cx).text(cx).to_string(),
+                ""
+            );
+            assert_eq!(
+                dashboard.feedback.as_deref(),
+                Some("Submitted — waiting for response")
+            );
+            assert_eq!(
+                dashboard.snapshot(cx).recent_instruction.as_deref(),
+                Some("first instruction")
+            );
+            dashboard.instruction_editor.update(cx, |editor, cx| {
+                editor.set_text("new draft", window, cx);
+            });
+        });
+
+        cx.run_until_parked();
+        let (connection, session_id) = dashboard.read_with(&cx, |dashboard, cx| {
+            let thread = dashboard.thread(cx).expect("thread should be loaded");
+            (
+                thread
+                    .read(cx)
+                    .connection()
+                    .clone()
+                    .downcast::<StubAgentConnection>()
+                    .expect("fixture should use StubAgentConnection"),
+                thread.read(cx).session_id().clone(),
+            )
+        });
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+
+        dashboard.read_with(&cx, |dashboard, cx| {
+            assert_eq!(
+                dashboard.instruction_editor.read(cx).text(cx).to_string(),
+                "new draft"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn sending_while_generating_queues_without_interrupting_the_current_turn(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, _panel, thread_metadata, _, mut cx) =
+            crate::mission_panel::tests::setup_workspace_with_two_threads(cx).await;
+        let dashboard = workspace.update_in(&mut cx, |workspace, window, cx| {
+            cx.new(|cx| {
+                WorkerDashboard::new(
+                    MissionId::new(),
+                    "Test mission".into(),
+                    thread_metadata.clone(),
+                    workspace.weak_handle(),
+                    workspace.panel::<AgentPanel>(cx),
+                    window,
+                    cx,
+                )
+            })
+        });
+        let thread = dashboard
+            .read_with(&cx, |dashboard, cx| dashboard.thread(cx))
+            .expect("thread should be loaded");
+        let current_turn = thread.update(&mut cx, |thread, cx| thread.send_raw("current turn", cx));
+        cx.run_until_parked();
+
+        dashboard.update_in(&mut cx, |dashboard, window, cx| {
+            dashboard.instruction_editor.update(cx, |editor, cx| {
+                editor.set_text("follow up", window, cx);
+            });
+            dashboard.send_instruction(window, cx);
+            assert_eq!(
+                dashboard
+                    .thread_view(cx)
+                    .expect("thread view should be loaded")
+                    .read(cx)
+                    .message_queue
+                    .len(),
+                1
+            );
+            assert_eq!(
+                dashboard
+                    .thread(cx)
+                    .expect("thread should be loaded")
+                    .read(cx)
+                    .status(),
+                acp_thread::ThreadStatus::Generating
+            );
+            assert_eq!(
+                dashboard.snapshot(cx).recent_instruction.as_deref(),
+                Some("follow up")
+            );
+        });
+
+        let (connection, session_id) = dashboard.read_with(&cx, |dashboard, cx| {
+            let thread = dashboard.thread(cx).expect("thread should be loaded");
+            (
+                thread
+                    .read(cx)
+                    .connection()
+                    .clone()
+                    .downcast::<StubAgentConnection>()
+                    .expect("fixture should use StubAgentConnection"),
+                thread.read(cx).session_id().clone(),
+            )
+        });
+        connection.set_next_prompt_updates(vec![acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new("queued response".into()),
+        )]);
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        current_turn.await.expect("the stub turn should finish");
+        cx.run_until_parked();
     }
 }
