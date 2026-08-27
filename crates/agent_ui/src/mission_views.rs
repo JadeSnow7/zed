@@ -8,16 +8,20 @@
 //!
 //! Shared Context and Evidence read the persisted `shared_context` store
 //! pull-based, matching how `mission_panel` treats it: the store publishes no
-//! change events, so each tab loads when it opens and reloads on request. The
-//! queue is different --- everything in it is live worker state, so it observes
-//! the Mission's threads directly and pins them so a worker going idle can't
-//! empty the queue out from under the user.
+//! change events, so each tab loads when it opens and reloads when the user
+//! asks, via the refresh control in its header. There is no push path; a tab
+//! left open shows what it last read.
+//!
+//! The queue is different --- everything in it is live worker state, so it
+//! observes the Mission's threads directly and re-renders as they change. It
+//! does not pin them: `WorkerDashboard` is the only thing in this crate that
+//! calls `pin_thread`.
 
 use chrono::{DateTime, Utc};
 use collections::HashSet;
 use gpui::{
     AnyElement, App, Entity, EventEmitter, FocusHandle, Focusable, SharedString, Subscription,
-    WeakEntity, Window,
+    Task, WeakEntity, Window,
 };
 use ui::{Chip, Color, Icon, IconName, IconSize, Indicator, Label, LabelSize, Tooltip, prelude::*};
 use workspace::{
@@ -42,9 +46,16 @@ use crate::{
 /// simply empty" distinction it carries, is written once.
 trait MissionContextHost: 'static + Sized {
     fn set_context_state(&mut self, state: MissionContextState, cx: &mut Context<Self>);
+    fn begin_refresh(&mut self) -> usize;
+    fn is_refresh_generation_current(&self, generation: usize) -> bool;
+    fn set_refresh_task(&mut self, task: Task<()>);
 }
 
-fn refresh_mission_context<T: MissionContextHost>(mission_id: MissionId, cx: &mut Context<T>) {
+fn refresh_mission_context<T: MissionContextHost>(
+    mission_id: MissionId,
+    generation: usize,
+    cx: &mut Context<T>,
+) -> Task<()> {
     // A missing store and a failed query both land on `Unavailable`, so the
     // "store never opened" case doesn't need its own early return -- which
     // matters because this runs during construction, where the entity cannot
@@ -59,11 +70,12 @@ fn refresh_mission_context<T: MissionContextHost>(mission_id: MissionId, cx: &mu
     cx.spawn(async move |this, cx| {
         let result = query.await;
         this.update(cx, |this, cx| {
-            this.set_context_state(mission_context_state_from_result(result), cx);
+            if this.is_refresh_generation_current(generation) {
+                this.set_context_state(mission_context_state_from_result(result), cx);
+            }
         })
         .ok();
     })
-    .detach();
 }
 
 /// Switches the agent panel to a worker's conversation. Shared by the tabs'
@@ -110,6 +122,8 @@ pub(crate) struct SharedContextView {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     context_state: MissionContextState,
+    refresh_generation: usize,
+    refresh_task: Option<Task<()>>,
     filter: Entity<editor::Editor>,
     _filter_subscription: Subscription,
 }
@@ -149,12 +163,14 @@ impl SharedContextView {
         let _filter_subscription =
             cx.subscribe(&filter, |_, _, _: &editor::EditorEvent, cx| cx.notify());
 
-        refresh_mission_context(mission.id, cx);
+        let refresh_task = refresh_mission_context(mission.id, 0, cx);
         Self {
             mission,
             workspace,
             focus_handle: cx.focus_handle(),
             context_state: MissionContextState::Loading,
+            refresh_generation: 0,
+            refresh_task: Some(refresh_task),
             filter,
             _filter_subscription,
         }
@@ -177,6 +193,20 @@ impl MissionContextHost for SharedContextView {
     fn set_context_state(&mut self, state: MissionContextState, cx: &mut Context<Self>) {
         self.context_state = state;
         cx.notify();
+    }
+
+    fn begin_refresh(&mut self) -> usize {
+        self.refresh_generation += 1;
+        self.refresh_task.take();
+        self.refresh_generation
+    }
+
+    fn is_refresh_generation_current(&self, generation: usize) -> bool {
+        self.refresh_generation == generation
+    }
+
+    fn set_refresh_task(&mut self, task: Task<()>) {
+        self.refresh_task = Some(task);
     }
 }
 
@@ -242,6 +272,7 @@ impl Render for SharedContextView {
                         matches(&decision.value)
                             || matches(&decision.key)
                             || matches(&decision.author)
+                            || decision.role.as_deref().is_some_and(|role| matches(role))
                     })
                     .map(|decision| {
                         Self::render_row(
@@ -265,6 +296,7 @@ impl Render for SharedContextView {
                         matches(&artifact.path)
                             || matches(&artifact.change_summary)
                             || matches(&artifact.author)
+                            || artifact.role.as_deref().is_some_and(|role| matches(role))
                     })
                     .map(|artifact| {
                         Self::render_row(
@@ -285,7 +317,11 @@ impl Render for SharedContextView {
                     .evidence
                     .iter()
                     .rev()
-                    .filter(|row| matches(&row.command) || matches(&row.author))
+                    .filter(|row| {
+                        matches(&row.command)
+                            || matches(&row.author)
+                            || row.role.as_deref().is_some_and(|role| matches(role))
+                    })
                     .map(|row| {
                         let stale = evidence_is_stale(row.created_at, newest_artifact);
                         Self::render_row(
@@ -377,6 +413,29 @@ impl Render for SharedContextView {
                                 ))
                                 .size(LabelSize::Small)
                                 .color(Color::Muted),
+                            )
+                            .child(div().flex_1())
+                            // These tabs read the store pull-based, and the
+                            // store publishes no change events, so an open tab
+                            // shows whatever was there when it opened. Workers
+                            // keep recording after that. Without this control
+                            // there is no way to see the new rows at all short
+                            // of closing and reopening the tab.
+                            .child(
+                                IconButton::new("shared-context-refresh", IconName::RotateCw)
+                                    .icon_size(IconSize::Small)
+                                    .tooltip(Tooltip::text("Reload shared context"))
+                                    .on_click(cx.listener(|this, _, _window, cx| {
+                                        this.context_state = MissionContextState::Loading;
+                                        cx.notify();
+                                        let generation = this.begin_refresh();
+                                        let task = refresh_mission_context(
+                                            this.mission.id,
+                                            generation,
+                                            cx,
+                                        );
+                                        this.set_refresh_task(task);
+                                    })),
                             ),
                     )
                     .child(
@@ -456,6 +515,8 @@ pub(crate) struct EvidenceView {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
     context_state: MissionContextState,
+    refresh_generation: usize,
+    refresh_task: Option<Task<()>>,
 }
 
 impl EvidenceView {
@@ -481,24 +542,31 @@ impl EvidenceView {
 
     fn new(mission: Mission, workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
         let mission_id = mission.id;
-        refresh_mission_context(mission_id, cx);
+        let refresh_task = refresh_mission_context(mission_id, 0, cx);
         Self {
             mission,
             workspace,
             focus_handle: cx.focus_handle(),
             context_state: MissionContextState::Loading,
+            refresh_generation: 0,
+            refresh_task: Some(refresh_task),
         }
     }
 
-    /// The worker whose role matches an Evidence row's author, so "Open
-    /// session" lands on the worker that actually ran the command. The
-    /// observer attributes rows to the thread's Mission role (see
-    /// `mission_context_observer`), which is what makes this lookup work.
-    fn worker_for_author(&self, author: &str, cx: &App) -> Option<ThreadMetadata> {
+    /// The worker an Evidence row belongs to, so "Open session" lands on the
+    /// one that actually ran the command.
+    ///
+    /// Matches on the row's `role`, not its `author`: `author` is who recorded
+    /// the row (`zed-observer`, or a Harness's self-reported name), which is a
+    /// different question and does not name a worker. Rows with no role --- one
+    /// from a Harness that omitted it, or from a thread with no Mission role
+    /// --- have no worker to open, which is the honest answer.
+    fn worker_for_role(&self, role: Option<&str>, cx: &App) -> Option<ThreadMetadata> {
+        let role = role?;
         mission_snapshot(&self.mission, &self.workspace, cx)
             .workers
             .into_iter()
-            .find(|worker| worker.label.as_ref() == author)
+            .find(|worker| worker.label.as_ref() == role)
             .map(|worker| worker.metadata)
     }
 }
@@ -507,6 +575,20 @@ impl MissionContextHost for EvidenceView {
     fn set_context_state(&mut self, state: MissionContextState, cx: &mut Context<Self>) {
         self.context_state = state;
         cx.notify();
+    }
+
+    fn begin_refresh(&mut self) -> usize {
+        self.refresh_generation += 1;
+        self.refresh_task.take();
+        self.refresh_generation
+    }
+
+    fn is_refresh_generation_current(&self, generation: usize) -> bool {
+        self.refresh_generation == generation
+    }
+
+    fn set_refresh_task(&mut self, task: Task<()>) {
+        self.refresh_task = Some(task);
     }
 }
 
@@ -537,6 +619,7 @@ impl Render for EvidenceView {
                         row.command.clone(),
                         row.result.clone(),
                         row.author.clone(),
+                        row.role.clone(),
                         row.exit_code,
                         row.created_at,
                         stale,
@@ -598,6 +681,18 @@ impl Render for EvidenceView {
                         Label::new(format!("{passing} passing · {stale_count} stale"))
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
+                    )
+                    .child(
+                        IconButton::new("evidence-refresh", IconName::RotateCw)
+                            .icon_size(IconSize::Small)
+                            .tooltip(Tooltip::text("Reload evidence"))
+                            .on_click(cx.listener(|this, _, _window, cx| {
+                                this.context_state = MissionContextState::Loading;
+                                cx.notify();
+                                let generation = this.begin_refresh();
+                                let task = refresh_mission_context(this.mission.id, generation, cx);
+                                this.set_refresh_task(task);
+                            })),
                     ),
             )
             .child(
@@ -620,6 +715,7 @@ impl EvidenceView {
         command: String,
         result: String,
         author: String,
+        role: Option<String>,
         exit_code: Option<i32>,
         created_at: DateTime<Utc>,
         stale: bool,
@@ -630,7 +726,10 @@ impl EvidenceView {
             Some(code) => format!("exit {code}"),
             None => "no exit code".to_string(),
         };
-        let worker = self.worker_for_author(&author, cx);
+        let worker = self.worker_for_role(role.as_deref(), cx);
+        // Attribution line: the role when we have one (that is the worker the
+        // reader is looking for), falling back to whoever recorded the row.
+        let attribution = role.unwrap_or_else(|| author.clone());
 
         v_flex()
             .w_full()
@@ -670,7 +769,7 @@ impl EvidenceView {
                     .child(div().flex_1())
                     .child(
                         Label::new(format!(
-                            "{author} · {} · {exit_label}",
+                            "{attribution} · {} · {exit_label}",
                             relative_time(created_at)
                         ))
                         .size(LabelSize::XSmall)
@@ -1359,6 +1458,15 @@ impl MissionStatusIndicator {
     /// `sync_worker_subscriptions`); the unconditional `cx.notify()` here is
     /// just a fallback so a missed subscription can't leave the status bar
     /// stuck on a stale count for more than one tick.
+    /// Re-reads the Mission list on a slow timer.
+    ///
+    /// `ThreadMetadataStore` *is* observable --- `MissionPanel` observes it ---
+    /// but observing it here would be the wrong trade. It notifies on every new
+    /// entry in every thread, and all this indicator needs from it is the
+    /// Mission list, which changes only when a Mission is created. A five
+    /// second poll costs one query; the observation would cost one per entry.
+    /// Everything that changes second-to-second comes from the live threads,
+    /// which are read on every render anyway.
     fn spawn_refresh(cx: &mut Context<Self>) -> gpui::Task<()> {
         cx.spawn(async move |this, cx| {
             loop {

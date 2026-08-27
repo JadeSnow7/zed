@@ -972,9 +972,14 @@ impl WorkerDashboard {
             .collect()
     }
 
-    /// Shared Context rows this worker recorded. The observer attributes rows
-    /// to a thread's Mission role (see `mission_context_observer`), which is
-    /// what makes this filter line up with what the worker actually did.
+    /// Shared Context rows belonging to this worker.
+    ///
+    /// Filtered on the row's `role`, not its `author`. `author` says who
+    /// recorded a row --- `zed-observer` for rows Zed derived, or a Harness's
+    /// own self-reported name --- and matching a role against that meant a
+    /// worker's own `record_decision` calls, which arrive as e.g.
+    /// `"claude-code"`, never matched the role and so never showed up on its
+    /// own page. See `shared_context::Decision::role`.
     fn render_recorded(&self) -> Vec<AnyElement> {
         let context = match &self.context_state {
             WorkerContextState::Loaded(context) => context,
@@ -998,7 +1003,11 @@ impl WorkerDashboard {
 
         let role = self.role.as_ref();
         let mut rows = Vec::new();
-        for decision in context.decisions.iter().filter(|row| row.author == role) {
+        for decision in context
+            .decisions
+            .iter()
+            .filter(|row| row.role.as_deref() == Some(role))
+        {
             rows.push(
                 h_flex()
                     .gap_2()
@@ -1012,7 +1021,11 @@ impl WorkerDashboard {
                     .into_any_element(),
             );
         }
-        for evidence in context.evidence.iter().filter(|row| row.author == role) {
+        for evidence in context
+            .evidence
+            .iter()
+            .filter(|row| row.role.as_deref() == Some(role))
+        {
             let succeeded = evidence.exit_code == Some(0);
             rows.push(
                 h_flex()

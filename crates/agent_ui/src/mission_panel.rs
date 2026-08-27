@@ -20,14 +20,20 @@
 //! who want it beside the thread list. The two are separate instances of the
 //! same type, so they cannot disagree about what a Mission looks like.
 //!
-//! Refresh is pull-based for everything persisted: the Mission list and the
-//! Shared Context trail reload when the panel becomes active or when the
-//! selected Mission changes, since neither `ThreadMetadataStore` nor
-//! `shared_context` publish change events and both change at the pace of
-//! Mission/thread creation. The exception is the selected Mission's live
-//! worker threads, which the panel observes directly -- "this worker is
-//! blocked on a permission" is useless if it only shows up at the next
-//! refresh.
+//! Three different refresh paths, because the three sources differ:
+//!
+//! - `ThreadMetadataStore` is a GPUI entity and *is* observed, so a worker
+//!   created elsewhere appears without the user touching anything. It notifies
+//!   on every new entry in every thread, though, which is far more often than
+//!   the Mission list actually changes --- so the dock instance gates its
+//!   observation on being visible (it refreshes on activation anyway) while the
+//!   sidebar instance, which has no activation hook, cannot.
+//! - `shared_context` publishes no change events at all, so the Decision and
+//!   Evidence trail is pulled: on activation, and when the selected Mission
+//!   changes.
+//! - The selected Mission's live worker threads are observed directly. "This
+//!   worker is blocked on a permission" is useless if it only shows up at the
+//!   next refresh.
 
 use acp_thread::AcpThread;
 use chrono::{DateTime, Utc};
@@ -35,14 +41,15 @@ use client::UserStore;
 use collections::{HashMap, HashSet};
 use editor::Editor;
 use gpui::{
-    Action as _, AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, IntoElement, ParentElement, Pixels, Render, SharedString, SharedUri, Styled,
-    Subscription, Task, WeakEntity, Window, div, px,
+    Action as _, AnyElement, App, AsyncWindowContext, Context, Decorations, Entity, EventEmitter,
+    FocusHandle, Focusable, IntoElement, ParentElement, Pixels, Render, SharedString, SharedUri,
+    Styled, Subscription, Task, WeakEntity, Window, div, px,
 };
 use project::{AgentServerStore, ProjectGroupKey, ProjectPath};
 use ui::{
     Avatar, Color, ContextMenu, Divider, Icon, IconButton, IconName, IconSize, Indicator, Label,
     LabelSize, ListItem, ListItemSpacing, PopoverMenu, Tooltip, prelude::*,
+    utils::platform_title_bar_height,
 };
 use util::ResultExt as _;
 use workspace::{
@@ -443,6 +450,21 @@ pub struct MissionPanel {
     /// for a Mission the user has since navigated away from can never land
     /// after — and overwrite — a later, faster one's result.
     _context_refresh_task: Option<Task<()>>,
+    /// Whether [`Self::_metadata_observation`] should do nothing while the
+    /// panel is hidden.
+    ///
+    /// True for the dock panel, which has a `set_active` hook and refreshes on
+    /// the way back in, so work done while it is closed costs nothing to skip.
+    /// False for the sidebar view, which has no such hook: gating it would mean
+    /// never refreshing at all.
+    ///
+    /// This gate matters more than it looks. `ThreadMetadataStore` is written
+    /// on *every* new entry in *every* thread, and each notification here costs
+    /// a mission list query, a full tree rebuild, and --- when the selection
+    /// changes --- three more Shared Context queries, once per live panel
+    /// instance. A hidden panel paying that for a thread the user cannot see is
+    /// pure waste.
+    host: MissionPanelHost,
     /// The dock panel refreshes when it becomes active; the sidebar view has
     /// no such hook, so both watch `ThreadMetadataStore` instead. Missions and
     /// workers are created through it, so a new worker shows up without the
@@ -450,13 +472,23 @@ pub struct MissionPanel {
     _metadata_observation: Option<Subscription>,
 }
 
-/// Re-reads the Mission list whenever `ThreadMetadataStore` changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MissionPanelHost {
+    Sidebar,
+    Dock,
+}
+
+/// Re-reads the Mission list whenever `ThreadMetadataStore` changes, unless
+/// this panel is hidden and refreshes on activation anyway.
 fn observe_metadata_store(
     window: &mut Window,
     cx: &mut Context<MissionPanel>,
 ) -> Option<Subscription> {
     let store = ThreadMetadataStore::try_global(cx)?;
     Some(cx.observe_in(&store, window, |this, _, window, cx| {
+        if this.host == MissionPanelHost::Dock && !this.is_active {
+            return;
+        }
         this.refresh(window, cx);
     }))
 }
@@ -483,6 +515,9 @@ impl MissionPanel {
             _worker_subscriptions: Vec::new(),
             load_error: None,
             _context_refresh_task: None,
+            // `set_active` refreshes on the way in, so nothing is lost by
+            // staying quiet while closed.
+            host: MissionPanelHost::Dock,
             _metadata_observation: observe_metadata_store(window, cx),
         }
     }
@@ -515,6 +550,9 @@ impl MissionPanel {
             _worker_subscriptions: Vec::new(),
             load_error: None,
             _context_refresh_task: None,
+            // No `set_active` hook here --- the observation is the only way
+            // this view ever learns about a new worker.
+            host: MissionPanelHost::Sidebar,
             _metadata_observation: observe_metadata_store(window, cx),
         };
         this.refresh(window, cx);
@@ -948,7 +986,12 @@ impl MissionPanel {
         )
     }
 
-    fn render_header(&self, snapshot: &MissionSnapshot, cx: &mut Context<Self>) -> AnyElement {
+    fn render_header(
+        &self,
+        snapshot: &MissionSnapshot,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let title: SharedString = snapshot
             .mission
             .as_ref()
@@ -967,14 +1010,31 @@ impl MissionPanel {
         let selected = self.selected_mission;
         let ungrouped = self.tree.ungrouped.len();
 
+        let sidebar_traffic_lights = self.host == MissionPanelHost::Sidebar
+            && cfg!(target_os = "macos")
+            && !window.is_fullscreen()
+            && !window.is_simple_fullscreen();
+        let header_height = if sidebar_traffic_lights {
+            platform_title_bar_height(window)
+        } else {
+            px(32.)
+        };
+
         h_flex()
             .id("mission-panel-header")
             .w_full()
-            .h(px(32.))
+            .h(header_height)
             .flex_none()
             .items_center()
             .gap_1p5()
-            .pl_2p5()
+            .map(|header| match window.window_decorations() {
+                Decorations::Client { .. } => header.mt(px(-1.)),
+                Decorations::Server => header.mt_px().pb_px(),
+            })
+            .when(sidebar_traffic_lights, |this| {
+                this.pl(px(ui::utils::TRAFFIC_LIGHT_PADDING))
+            })
+            .when(!sidebar_traffic_lights, |this| this.pl_2p5())
             .pr_1()
             .border_b_1()
             .border_color(cx.theme().colors().border)
@@ -1511,7 +1571,10 @@ impl MissionPanel {
                     .child(
                         Label::new(format!(
                             "{} · {}",
-                            decision.author,
+                            // The role names the worker; `author` only names
+                            // whatever recorded the row. Prefer the former when
+                            // it is there. See `shared_context::Decision::role`.
+                            decision.role.as_deref().unwrap_or(&decision.author),
                             relative_time(decision.created_at)
                         ))
                         .size(LabelSize::XSmall)
@@ -1962,7 +2025,7 @@ impl Focusable for MissionPanel {
 }
 
 impl Render for MissionPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Read the Mission's workers and their changed files once: every
         // section below needs them, and walking each worker's changed buffers
         // per section would be the same work repeated.
@@ -1981,7 +2044,7 @@ impl Render for MissionPanel {
             .on_action(cx.listener(|_, _: &ShowThreadList, _window, cx| {
                 cx.emit(MissionPanelEvent::ShowThreadList);
             }))
-            .child(self.render_header(&snapshot, cx))
+            .child(self.render_header(&snapshot, window, cx))
             .children(self.render_load_error(cx))
             .child(self.render_summary(&snapshot, cx))
             .child(
@@ -2050,7 +2113,12 @@ impl Panel for MissionPanel {
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.is_active = active;
         if active {
-            self.refresh(window, cx);
+            let workspace = self.workspace.clone();
+            cx.defer_in(window, move |this, window, cx| {
+                if this.is_active && workspace.upgrade().is_some() {
+                    this.refresh(window, cx);
+                }
+            });
         }
     }
 
@@ -2644,6 +2712,34 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn activating_the_mission_dock_defers_refresh_until_workspace_update_finishes(
+        cx: &mut TestAppContext,
+    ) {
+        let (workspace, _agent_panel, _thread_a, _thread_b, mut cx) =
+            setup_workspace_with_two_threads(cx).await;
+
+        let panel = workspace.update_in(&mut cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| MissionPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace
+                .right_dock()
+                .update(cx, |dock, cx| dock.set_open(true, window, cx));
+            panel
+        });
+
+        // `toggle_panel_focus` calls the panel's `set_active` while it still
+        // holds a mutable Workspace lease. The deferred refresh must therefore
+        // run only after this update returns; an eager refresh reproduces the
+        // double-lease panic from the Mission button.
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<MissionPanel>(window, cx);
+        });
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| assert!(panel.is_active));
+    }
+
+    #[gpui::test]
     async fn clicking_a_thread_row_reuses_load_agent_thread_instead_of_creating_one(
         cx: &mut TestAppContext,
     ) {
@@ -2732,6 +2828,7 @@ mod tests {
             "key".to_string(),
             "mission A's decision".to_string(),
             "tester".to_string(),
+            None,
         ))
         .unwrap();
         gpui::block_on(store.record_decision(
@@ -2739,6 +2836,7 @@ mod tests {
             "key".to_string(),
             "mission B's decision".to_string(),
             "tester".to_string(),
+            None,
         ))
         .unwrap();
 
